@@ -5,7 +5,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::fence::Held;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
@@ -229,11 +229,21 @@ impl Written {
             Written::SystemTimestamp => system_timestamp(),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
+        // Use atomic Release stores when aligned so concurrent readers (such
+        // as a fence's `AtomicU64` value) observe them without a data race.
         unsafe {
             if bytes == 4 {
-                at.cast::<u32>().write_unaligned(value as u32);
+                if (at as usize).is_multiple_of(align_of::<AtomicU32>()) {
+                    (*at.cast::<AtomicU32>()).store(value as u32, Ordering::Release);
+                } else {
+                    at.cast::<u32>().write_unaligned(value as u32);
+                    std::sync::atomic::fence(Ordering::Release);
+                }
+            } else if (at as usize).is_multiple_of(align_of::<AtomicU64>()) {
+                (*at.cast::<AtomicU64>()).store(value, Ordering::Release);
             } else {
                 at.cast::<u64>().write_unaligned(value);
+                std::sync::atomic::fence(Ordering::Release);
             }
         }
         // A write at a fence's GPU address moves its value.
@@ -828,6 +838,57 @@ mod tests {
         assert_eq!(*CALLS.lock().unwrap(), vec![(dst, 0, PAGE)]);
 
         for object in [waits, signals, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// A queue held back behind a fence whose memory is written directly
+    /// (bypassing `Signal` and bottom-of-pipe writes) wakes without needing
+    /// another submission on that queue.
+    #[test]
+    fn direct_memory_write_wakes_held_queue() {
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut waits = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+
+        let signal = |q: This| slot::<Sync>(q, signal_slot(q));
+        let wait = |q: This| slot::<Sync>(q, signal_slot(q) + 8);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let address = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x60)(f) as usize;
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        assert_eq!(wait(waits)(waits, ready, 4), S_OK);
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+        assert_eq!(completed(done), 0);
+
+        // SAFETY: `address(ready)` is the fence's `AtomicU64` value.
+        unsafe { (*(address(ready) as *const AtomicU64)).store(4, Ordering::Release) };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while completed(done) < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            completed(done),
+            1,
+            "held queue did not wake on direct write"
+        );
+
+        for object in [waits, ready, done] {
             assert_eq!(release(object), 0);
         }
     }

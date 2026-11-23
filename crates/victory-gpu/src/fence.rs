@@ -66,6 +66,86 @@ fn live() -> MutexGuard<'static, BTreeMap<usize, usize>> {
 /// saying it is stuck.
 const RECHECK: Duration = Duration::from_millis(100);
 const STALL: Duration = Duration::from_secs(5);
+/// How often the background watcher re-checks live fences while at least one
+/// event or queue wait is pending (for direct CPU/shader memory writes).
+const WATCH_POLL: Duration = Duration::from_millis(10);
+
+struct Watcher {
+    /// Incremented whenever an event or queue wait is added. Pure leaf lock:
+    /// never held while acquiring `LIVE`, fence locks, or a timeline lock.
+    generation: Mutex<u64>,
+    added: Condvar,
+}
+
+static WATCHER: Watcher = Watcher {
+    generation: Mutex::new(0),
+    added: Condvar::new(),
+};
+
+fn watch_notify() {
+    static THREAD: std::sync::Once = std::sync::Once::new();
+    {
+        let mut g = WATCHER.generation.lock().unwrap_or_else(|e| e.into_inner());
+        *g = g.wrapping_add(1);
+        WATCHER.added.notify_one();
+    }
+    THREAD.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-fence-watch".into())
+            .spawn(watch_loop);
+    });
+}
+
+fn watch_loop() {
+    loop {
+        let seen = *WATCHER.generation.lock().unwrap_or_else(|e| e.into_inner());
+        let (woken, any_waiting) = scan_live_fences();
+        if !woken.is_empty() {
+            run_held(woken);
+            continue;
+        }
+        let g = WATCHER.generation.lock().unwrap_or_else(|e| e.into_inner());
+        if *g != seen {
+            continue;
+        }
+        if any_waiting {
+            drop(
+                WATCHER
+                    .added
+                    .wait_timeout(g, WATCH_POLL)
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        } else {
+            drop(WATCHER.added.wait(g).unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+}
+
+/// Checks every live fence for event or queue waits whose value has been
+/// reached outside `Signal` / bottom-of-pipe writes (for example a CPU write
+/// to the fence's memory).
+fn scan_live_fences() -> (Vec<Arc<Timeline>>, bool) {
+    let live = live();
+    let mut woken = Vec::new();
+    let mut any_waiting = false;
+    for &ptr in live.values() {
+        // SAFETY: registered fences stay alive until `Fence::drop`, which
+        // takes the `LIVE` lock we hold here.
+        let fence = unsafe { &*(ptr as *const Fence) };
+        let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
+        if waiters.is_empty() && queues.is_empty() {
+            continue;
+        }
+        let (more, moved) = wake_locked(fence, &mut waiters, &mut queues);
+        if moved {
+            fence.moved.notify_all();
+        }
+        woken.extend(more);
+        any_waiting |= !waiters.is_empty() || !queues.is_empty();
+    }
+    (woken, any_waiting)
+}
 
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
@@ -130,6 +210,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     if !event.is_null() {
         waiters.push((value, event as usize));
+        drop(waiters);
+        watch_notify();
         return S_OK;
     }
     // A null event: block until the value is reached, as D3D12 does.
@@ -163,33 +245,46 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     S_OK
 }
 
+/// Wakes any events and queues on `fence` whose value has been reached;
+/// returns the timelines to resume once locks are dropped and whether
+/// anything changed.
+#[must_use]
+fn wake_locked(
+    fence: &Fence,
+    waiters: &mut Vec<(u64, usize)>,
+    queues: &mut Vec<(u64, Weak<Timeline>)>,
+) -> (Vec<Arc<Timeline>>, bool) {
+    let value = fence.value.load(Ordering::Acquire);
+    let mut moved = false;
+    waiters.retain(|&(wanted, event)| {
+        let reached = wanted <= value;
+        if reached {
+            set_event(event);
+            moved = true;
+        }
+        !reached
+    });
+    let mut woken = Vec::new();
+    queues.retain(|(wanted, queue)| {
+        if *wanted <= value {
+            woken.extend(queue.upgrade());
+            moved = true;
+            false
+        } else {
+            queue.strong_count() > 0
+        }
+    });
+    (woken, moved)
+}
+
 /// Sets the events whose value the fence has reached, wakes the blocking
 /// waits and returns the queues to wake, for [`run_held`] once no fence
 /// lock is held.
 #[must_use]
 fn wake(fence: &Fence, mut waiters: MutexGuard<'_, Vec<(u64, usize)>>) -> Vec<Arc<Timeline>> {
-    let value = fence.value.load(Ordering::Acquire);
-    waiters.retain(|&(wanted, event)| {
-        let reached = wanted <= value;
-        if reached {
-            set_event(event);
-        }
-        !reached
-    });
+    let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
+    let (woken, _) = wake_locked(fence, &mut waiters, &mut queues);
     fence.moved.notify_all();
-    let mut woken = Vec::new();
-    fence
-        .queues
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(wanted, queue)| {
-            if *wanted <= value {
-                woken.extend(queue.upgrade());
-                false
-            } else {
-                queue.strong_count() > 0
-            }
-        });
     woken
 }
 
@@ -229,6 +324,8 @@ impl Held {
         if !queues.iter().any(|(v, q)| *v == value && q.ptr_eq(&queue)) {
             queues.push((value, queue));
         }
+        drop(queues);
+        watch_notify();
         false
     }
 }
@@ -410,6 +507,30 @@ mod tests {
         crate::queue::Written::Value(9).write(address(f) as *mut u8, 8);
         // SAFETY: a valid event.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // SAFETY: ours.
+        unsafe { CloseHandle(event) };
+        release_fence(f);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_memory_write_sets_waiting_event() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let f = new_fence(0);
+        // SAFETY: plain manual-reset event.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        assert_eq!(slot::<Wait>(f, 0x48)(f, 11, event), S_OK);
+        // SAFETY: a valid event.
+        assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // Direct write to the fence's GPU address, bypassing `Signal` and
+        // `Written::write`.
+        // SAFETY: `address(f)` is `Fence::value`, an `AtomicU64`.
+        unsafe { (*(address(f) as *const AtomicU64)).store(11, Ordering::Release) };
+        // SAFETY: a valid event.
+        assert_eq!(unsafe { WaitForSingleObject(event, 2_000) }, WAIT_OBJECT_0);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         release_fence(f);
