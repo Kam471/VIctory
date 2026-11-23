@@ -400,14 +400,27 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+/// One page-mapping operation captured from a batch at submission time.
+#[derive(Clone, Copy)]
+enum PageOp {
+    /// Map `len` consecutive pool bytes from `source` at `at`.
+    Copy { at: u64, source: u64, len: u64 },
+    /// Map the single pool page at `source` repeatedly `count` times from `at`.
+    Fill { at: u64, source: u64, count: u64 },
+    /// Unmap `len` bytes at `at`.
+    Unmap { at: u64, len: u64 },
+    /// Out-of-bounds pool index, overflow, or unknown range kind.
+    Invalid,
+}
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Runs through the queue's
+/// timeline so a held-back queue updates mappings after its earlier work.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -420,13 +433,15 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    // Read now: the batch and range arrays belong to the title (often on its
+    // stack) and may be reused before a held-back queue runs them.
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    let mut ok = true;
+    let mut ops = Vec::new();
     for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
+        if b.ranges.is_null() || b.count == 0 {
             continue;
         }
         // SAFETY: each batch holds `count` ranges.
@@ -434,23 +449,54 @@ extern "system" fn copy_page_mappings(
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
+            let Some(next) = at.checked_add(len) else {
+                ops.push(PageOp::Invalid);
+                break;
             };
-            at += len;
+            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let source = || pool.checked_add(u64::from(r.start) * PAGE);
+            match r.kind {
+                0 if inside(r.count) => match source() {
+                    Some(source) => ops.push(PageOp::Copy { at, source, len }),
+                    None => ops.push(PageOp::Invalid),
+                },
+                1 if inside(1) => match source() {
+                    Some(source) => ops.push(PageOp::Fill {
+                        at,
+                        source,
+                        count: u64::from(r.count),
+                    }),
+                    None => ops.push(PageOp::Invalid),
+                },
+                2 => ops.push(PageOp::Unmap { at, len }),
+                3 => {}
+                _ => ops.push(PageOp::Invalid),
+            }
+            at = next;
         }
+    }
+    queue(this).timeline.submit(Op::Run(Box::new(move || {
+        apply_page_mappings(map, pool, &ops)
+    })));
+    S_OK
+}
+
+fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageOp]) {
+    let mut ok = true;
+    for &op in ops {
+        ok &= match op {
+            PageOp::Copy { at, source, len } => map(at, source, len),
+            PageOp::Fill { at, source, count } => {
+                (0..count).all(|k| map(at + k * PAGE, source, PAGE))
+            }
+            PageOp::Unmap { at, len } => map(at, 0, len),
+            PageOp::Invalid => false,
+        };
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
-    S_OK
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -663,6 +709,123 @@ mod tests {
             S_OK
         );
         assert_eq!(FRAMES.load(Ordering::Relaxed), before + 2);
+
+        for object in [waits, signals, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Page mappings submitted after a wait must not run until the wait is
+    /// reached, and must capture caller-owned batch/range arrays at call time.
+    #[test]
+    fn page_mappings_run_after_a_queues_wait() {
+        use std::sync::Mutex;
+
+        static CALLS: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+        fn record(to: u64, from: u64, len: u64) -> bool {
+            CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((to, from, len));
+            true
+        }
+        crate::resource::use_page_mapper(record);
+
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type CopyPages = extern "system" fn(This, u32, *const PageBatch, u64, u32, u32) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut waits, mut signals) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut signals), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+
+        let signal = |q: This| slot::<Sync>(q, signal_slot(q));
+        let wait = |q: This| slot::<Sync>(q, signal_slot(q) + 8);
+        let copy_pages = |q: This| slot::<CopyPages>(q, signal_slot(q) + 0x78);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let pool = 0x1000_0000_u64;
+        let dst = 0x2000_0000_u64;
+        CALLS.lock().unwrap().clear();
+        assert_eq!(wait(waits)(waits, ready, 1), S_OK);
+        {
+            // Heap-allocated so they are freed before the queue wakes.
+            let ranges = Box::new([
+                PageRange {
+                    kind: 0,
+                    start: 1,
+                    count: 2,
+                },
+                PageRange {
+                    kind: 1,
+                    start: 3,
+                    count: 2,
+                },
+                PageRange {
+                    kind: 2,
+                    start: 0,
+                    count: 1,
+                },
+                PageRange {
+                    kind: 3,
+                    start: 0,
+                    count: 1,
+                },
+            ]);
+            let batch = Box::new(PageBatch {
+                destination: dst,
+                count: ranges.len() as u32,
+                ranges: ranges.as_ptr(),
+            });
+            assert_eq!(copy_pages(waits)(waits, 1, &*batch, pool, 4, 0), S_OK);
+        }
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+
+        assert!(
+            CALLS.lock().unwrap().is_empty(),
+            "page mappings ran before the wait was reached"
+        );
+        assert_eq!(completed(done), 0);
+
+        assert_eq!(signal(signals)(signals, ready, 1), S_OK);
+        assert_eq!(completed(done), 1);
+        assert_eq!(
+            *CALLS.lock().unwrap(),
+            vec![
+                (dst, pool + PAGE, 2 * PAGE),
+                (dst + 2 * PAGE, pool + 3 * PAGE, PAGE),
+                (dst + 3 * PAGE, pool + 3 * PAGE, PAGE),
+                (dst + 4 * PAGE, 0, PAGE),
+            ]
+        );
+
+        // Not held any more: runs at once.
+        CALLS.lock().unwrap().clear();
+        let range = PageRange {
+            kind: 2,
+            start: 0,
+            count: 1,
+        };
+        let batch = PageBatch {
+            destination: dst,
+            count: 1,
+            ranges: &range,
+        };
+        assert_eq!(copy_pages(waits)(waits, 1, &batch, pool, 4, 0), S_OK);
+        assert_eq!(*CALLS.lock().unwrap(), vec![(dst, 0, PAGE)]);
 
         for object in [waits, signals, ready, done] {
             assert_eq!(release(object), 0);
