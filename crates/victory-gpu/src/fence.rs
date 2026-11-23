@@ -202,30 +202,25 @@ fn run_held(queues: Vec<Arc<Timeline>>) {
 }
 
 /// A reference to a fence held by a queue's work, given back on drop.
-pub(crate) struct Held(This);
-
-// SAFETY: fences are made for use from many threads (the value is atomic,
-// the rest locked).
-unsafe impl Send for Held {}
+pub(crate) struct Held(object::Held);
 
 impl Held {
     pub(crate) fn new(this: This) -> Held {
-        object::add_ref(this);
-        Held(this)
+        Held(object::Held::new(this))
     }
 
     pub(crate) fn reached(&self, value: u64) -> bool {
-        fence(self.0).value.load(Ordering::Acquire) >= value
+        fence(self.0.get()).value.load(Ordering::Acquire) >= value
     }
 
     pub(crate) fn signal(&self, value: u64) {
-        signal(self.0, value);
+        signal(self.0.get(), value);
     }
 
     /// Whether the value is reached; if not, `queue` is woken once it is.
     /// Checked under the lock a signal takes, so no signal is missed.
     pub(crate) fn wait_on_gpu(&self, value: u64, queue: &Arc<Timeline>) -> bool {
-        let fence = fence(self.0);
+        let fence = fence(self.0.get());
         let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
         if fence.value.load(Ordering::Acquire) >= value {
             return true;
@@ -235,12 +230,6 @@ impl Held {
             queues.push((value, queue));
         }
         false
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        release(self.0);
     }
 }
 

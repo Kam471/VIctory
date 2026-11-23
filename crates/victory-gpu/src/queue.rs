@@ -266,11 +266,34 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // Read now: the parameters are the title's, maybe on its stack. The
+    // frame is shown in the queue's order, after the work before it.
+    let plane = if planes > 0 {
+        // SAFETY: the title passes `planes` plane descriptions.
+        unsafe { plane_parameters.as_ref() }
+    } else {
+        None
+    };
+    let resource = plane
+        .filter(|plane| plane.count > 0 && !plane.resources.is_null())
+        // SAFETY: the plane lists `count` resources.
+        .map(|plane| unsafe { *plane.resources })
+        .filter(|resource| !resource.is_null())
+        .map(object::Held::new);
+    queue(this)
+        .timeline
+        .submit(Op::Run(Box::new(move || show(resource))));
+    S_OK
+}
+
+/// A present, once the queue's work before it has run: counts the frame
+/// and shows the plane's first resource.
+fn show(resource: Option<object::Held>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -305,13 +328,7 @@ extern "system" fn present(
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+    if let Some(resource) = resource.as_ref().map(object::Held::get)
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -326,8 +343,7 @@ extern "system" fn present(
         let _ = shown;
     }
     #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
-    S_OK
+    let _ = resource;
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
@@ -573,6 +589,81 @@ mod tests {
         assert_eq!(completed(done), 2);
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [waits, signals, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// A present submitted after a wait must not run until the wait is
+    /// reached, must read its stack plane parameters at submission time and
+    /// must keep its resource alive until it runs.
+    #[test]
+    fn present_runs_after_a_queues_wait() {
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut waits, mut signals) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut signals), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+        let resource = crate::resource::test_buffer(256);
+
+        let signal = |q: This| slot::<Sync>(q, signal_slot(q));
+        let wait = |q: This| slot::<Sync>(q, signal_slot(q) + 8);
+        let present = |q: This| slot::<Present>(q, signal_slot(q) + 0x80);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let add_ref = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x08)(o);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let before = FRAMES.load(Ordering::Relaxed);
+        assert_eq!(wait(waits)(waits, ready, 1), S_OK);
+        {
+            // Caller's plane parameters may live on its stack and be gone
+            // before the queue wakes.
+            let resources = Box::new([resource]);
+            let plane = Box::new(Plane {
+                token: 1,
+                count: 1,
+                resources: resources.as_ptr(),
+            });
+            assert_eq!(present(waits)(waits, 1, &*plane, std::ptr::null()), S_OK);
+        }
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+
+        assert_eq!(
+            FRAMES.load(Ordering::Relaxed),
+            before,
+            "presented before the wait was reached"
+        );
+        assert_eq!(completed(done), 0);
+        // The queued present holds a reference of its own.
+        assert_eq!(add_ref(resource), 3);
+        assert_eq!(release(resource), 2);
+
+        assert_eq!(signal(signals)(signals, ready, 1), S_OK);
+        assert_eq!(FRAMES.load(Ordering::Relaxed), before + 1);
+        assert_eq!(completed(done), 1);
+        assert_eq!(release(resource), 0, "present gave back its reference");
+
+        // Not held any more: present runs at once.
+        assert_eq!(
+            present(waits)(waits, 0, std::ptr::null(), std::ptr::null()),
+            S_OK
+        );
+        assert_eq!(FRAMES.load(Ordering::Relaxed), before + 2);
+
         for object in [waits, signals, ready, done] {
             assert_eq!(release(object), 0);
         }
