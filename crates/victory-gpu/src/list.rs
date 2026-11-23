@@ -128,11 +128,20 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 impl Drop for List {
     fn drop(&mut self) {
         let uploads = std::mem::take(self.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
-        if !uploads.is_empty()
-            && let Some(pending) = self.host.get_mut().unwrap_or_else(|e| e.into_inner()).as_ref()
+        if let Some(pending) = self
+            .host
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
             && std::sync::Arc::strong_count(pending) > 1
         {
             pending.keep_uploads(uploads);
+            let dynamic = self
+                .state
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_dynamic();
+            pending.keep_dynamic(dynamic);
         }
     }
 }
@@ -231,7 +240,7 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: std::sync::Mutex::new(crate::host::host().and_then(|h| match h.new_list() {
+        host: std::sync::Mutex::new(crate::host::host().and_then(|h| match h.acquire_list() {
             Ok(list) => Some(std::sync::Arc::new(list)),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -281,31 +290,37 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     let list = unsafe { &*this.cast::<List>() };
     let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
     // A submission of the list still to run (its queue waits for a fence)
-    // keeps the host list and the memory handed out for it; recording goes
-    // on in a new list, open already.
+    // keeps the host list, its upload memory and its dynamic descriptor
+    // slots; recording goes on in a pooled or new list, open already.
     #[cfg(windows)]
-    let fresh = {
+    let (fresh, keep_pending) = {
         let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
         match host.as_ref() {
             Some(pending) if std::sync::Arc::strong_count(pending) > 1 => {
-                match crate::host::host().map(|h| h.new_list()) {
+                pending.keep_uploads(uploads);
+                let dynamic = list
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take_dynamic();
+                pending.keep_dynamic(dynamic);
+                match crate::host::host().map(|h| h.acquire_list()) {
                     Some(Ok(new)) => {
-                        pending.keep_uploads(uploads);
                         *host = Some(std::sync::Arc::new(new));
-                        true
+                        (true, false)
                     }
                     _ => {
                         tracing::warn!("no new host list: a list to run is reset");
-                        false
+                        (false, true)
                     }
                 }
             }
-            _ => false,
+            _ => (false, false),
         }
     };
     #[cfg(windows)]
     with_state(this, |host, state| {
-        if !fresh {
+        if !fresh && !keep_pending {
             host.reset();
         }
         state.reset(pipeline);
@@ -1481,5 +1496,109 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// Resetting or dropping a list whose submission is held behind a fence
+    /// wait keeps its upload blocks alive until the submission runs, and
+    /// recycles the detached host list back into the host's pool.
+    #[cfg(windows)]
+    #[test]
+    fn pending_list_reset_and_drop_keep_uploads_and_recycle_host_list() {
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        let null = std::ptr::null();
+        let (waits, sig_slot) = crate::queue::test_queue();
+        let wait = slot::<Sync>(waits, sig_slot + 8);
+        let signal = slot::<Sync>(waits, sig_slot);
+        let execute = slot::<Execute>(waits, 0x50);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        // Hold the queue, record a copy from list upload memory, submit, then
+        // reset the list while its submission is still waiting.
+        assert_eq!(wait(waits, ready, 1), S_OK);
+        let src1 = allocate_upload(list, 64, 16);
+        assert!(!src1.is_null());
+        // SAFETY: 64 bytes handed out above.
+        unsafe { src1.write_bytes(0x3c, 64) };
+        let mut dst1 = [0u8; 64];
+        copy_memory(list, dst1.as_mut_ptr() as u64, src1 as u64, 64, 0);
+        assert_eq!(close(list), S_OK);
+        let raw1 = host_list(list).unwrap().list.as_raw() as usize;
+        execute(waits, 1, &list);
+        assert_eq!(signal(waits, done, 1), S_OK);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        let raw2 = host_list(list).unwrap().list.as_raw() as usize;
+        assert_ne!(raw2, raw1, "reset must detach from the pending host list");
+        assert_eq!(dst1, [0u8; 64]);
+
+        let reused_before = host.reused_lists();
+        assert_eq!(crate::fence::signal(ready, 1), S_OK);
+        assert_eq!(completed(done), 1);
+        assert_eq!(dst1, [0x3c; 64], "kept upload memory reached the copy");
+
+        // Now hold behind ready == 2: reset `list` again (reusing a pooled
+        // host list) and also drop a second list while its submission waits.
+        assert_eq!(wait(waits, ready, 2), S_OK);
+        assert_eq!(close(list), S_OK);
+        execute(waits, 1, &list);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(
+            host.reused_lists() > reused_before,
+            "detached host list should be recycled from the pool"
+        );
+
+        let mut list2 = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list2),
+            S_OK
+        );
+        let src2 = allocate_upload(list2, 64, 16);
+        assert!(!src2.is_null());
+        // SAFETY: 64 bytes handed out above.
+        unsafe { src2.write_bytes(0x5a, 64) };
+        let mut dst2 = [0u8; 64];
+        copy_memory(list2, dst2.as_mut_ptr() as u64, src2 as u64, 64, 0);
+        assert_eq!(close(list2), S_OK);
+        execute(waits, 1, &list2);
+        assert_eq!(signal(waits, done, 2), S_OK);
+        // Drop `list2` while its submission is still held back.
+        assert_eq!(release(list2), 0);
+        assert_eq!(dst2, [0u8; 64]);
+
+        assert_eq!(crate::fence::signal(ready, 2), S_OK);
+        assert_eq!(completed(done), 2);
+        assert_eq!(
+            dst2, [0x5a; 64],
+            "dropping a pending list must keep its upload memory until run"
+        );
+
+        for object in [list, allocator, waits, ready, done] {
+            assert_eq!(release(object), 0);
+        }
     }
 }

@@ -34,6 +34,8 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+/// Maximum number of detached host lists kept for reuse after pending resets.
+const LIST_POOL_CAP: usize = 64;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -53,6 +55,10 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Detached host lists whose submissions finished, ready to reuse.
+    free_lists: Mutex<Vec<HostList>>,
+    #[cfg(test)]
+    reused_lists: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -223,6 +229,9 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            free_lists: Mutex::default(),
+            #[cfg(test)]
+            reused_lists: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -245,10 +254,13 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
-    /// Memory handed out for the list's recording, kept until it is dropped
-    /// when the title reset the list while a submission of it was still to
-    /// run.
+    /// Memory handed out for the list's recording, kept until it is finished
+    /// when the title reset or dropped the list while a submission of it was
+    /// still to run.
     kept_uploads: Mutex<Vec<Vec<u8>>>,
+    /// Dynamic descriptor slots kept alongside `kept_uploads` until the pending
+    /// submission completes.
+    kept_dynamic: Mutex<Vec<(usize, u32, u32)>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions have reserved (`indirect`): a
@@ -258,6 +270,12 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+}
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        self.release_kept();
+    }
 }
 
 // SAFETY: D3D12 lists and allocators may be used from any thread, one at
@@ -388,6 +406,39 @@ impl Host {
         })
     }
 
+    /// A recycled host list (reset and open), or a new one when the pool is
+    /// empty.
+    pub(crate) fn acquire_list(&self) -> windows::core::Result<HostList> {
+        let pooled = self
+            .free_lists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop();
+        if let Some(list) = pooled {
+            #[cfg(test)]
+            self.reused_lists.fetch_add(1, Ordering::Relaxed);
+            list.reset();
+            return Ok(list);
+        }
+        self.new_list()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reused_lists(&self) -> u64 {
+        self.reused_lists.load(Ordering::Relaxed)
+    }
+
+    /// Returns a finished, unreferenced host list to the pool up to
+    /// [`LIST_POOL_CAP`], releasing any kept upload blocks and dynamic slots
+    /// immediately.
+    pub(crate) fn recycle_list(&self, list: HostList) {
+        list.release_kept();
+        let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < LIST_POOL_CAP {
+            pool.push(list);
+        }
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -419,6 +470,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 kept_uploads: Mutex::default(),
+                kept_dynamic: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -696,12 +748,38 @@ impl Host {
 
 impl HostList {
     /// Keeps `blocks` (memory handed out for the recording) until the list
-    /// is dropped.
+    /// finishes executing and is recycled or dropped.
     pub(crate) fn keep_uploads(&self, blocks: Vec<Vec<u8>>) {
+        if !blocks.is_empty() {
+            self.kept_uploads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(blocks);
+        }
+    }
+
+    /// Keeps dynamic descriptor slots alive until this host list finishes
+    /// executing and is recycled or dropped.
+    pub(crate) fn keep_dynamic(&self, slots: Vec<(usize, u32, u32)>) {
+        if !slots.is_empty() {
+            self.kept_dynamic
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(slots);
+        }
+    }
+
+    /// Frees kept upload blocks and returns kept dynamic descriptor slots.
+    fn release_kept(&self) {
         self.kept_uploads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .extend(blocks);
+            .clear();
+        let dynamic =
+            std::mem::take(&mut *self.kept_dynamic.lock().unwrap_or_else(|e| e.into_inner()));
+        for (heap, first, n) in dynamic {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -716,6 +794,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.release_kept();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
