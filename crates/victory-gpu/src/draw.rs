@@ -928,29 +928,44 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        let len = u64::from(stride) * u64::from(max.max(1));
+        let Some(len) = crate::indirect::byte_len(kind, stride, max) else {
+            return false;
+        };
+        if max == 0 {
+            return true;
+        }
         let Some(args) = crate::shadow::find(arguments, len) else {
             return false;
         };
+        if !args.offset(arguments).is_multiple_of(4) {
+            return false;
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
-                Some(s) => Some((s, at)),
-                None => return false,
+                Some(s) if s.offset(at).is_multiple_of(4) => Some((s, at)),
+                _ => return false,
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let Some(signature) = host_signature(kind, stride) else {
             return false;
         };
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let separate_counter = counter
+            .as_ref()
+            .map(|(s, _)| &s.buffer)
+            .filter(|&buffer| buffer != &args.buffer);
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            separate_counter,
+            (kind, stride, max),
+        ) {
             return false;
         }
         self.host_pipeline = 0;
@@ -968,7 +983,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, separate_counter);
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -987,7 +1002,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, separate_counter);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

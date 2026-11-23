@@ -1150,8 +1150,8 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let address = indirect_address(arguments, offset, u64::from(stride) * u64::from(max));
+    let counter = indirect_address(count, count_offset, 4);
     let mut ran = false;
     // shortcut: off unless `VICTORY_INDIRECT` is set (diagnostics builds):
     // with it the world presented no frame for 30 s and the title's own
@@ -1187,6 +1187,16 @@ extern "system" fn execute_indirect(
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+/// Check against the title buffer before resolving its host copy, which
+/// may include other memory or padding beyond the title's buffer.
+fn indirect_address(buffer: This, offset: u64, len: u64) -> Option<u64> {
+    let (base, size) = crate::resource::buffer_bytes(buffer)?;
+    if !offset.is_multiple_of(4) || offset.checked_add(len)? > size {
+        return None;
+    }
+    (base as u64).checked_add(offset)
 }
 
 /// Indirect executions dropped since the last call.

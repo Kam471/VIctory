@@ -247,7 +247,7 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
-    /// The work its indirect executions may still do (`indirect`): a
+    /// The work its indirect executions have reserved (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -338,8 +338,6 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
-    /// Whether a step zeroes the indirect-work budget.
-    budget_zeroed: bool,
 }
 
 impl Host {
@@ -432,6 +430,13 @@ impl Host {
         }
         batch.flush();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        for list in runs {
+            if let Some(Some((_, data))) = list.budget.get() {
+                // SAFETY: the list's mapped budget word. The submission lock
+                // keeps the CPU reset from racing a previous GPU submission.
+                unsafe { (*data as *mut u32).write_volatile(0) };
+            }
+        }
         *submitted += 1;
         let prepared = std::time::Instant::now();
         // SAFETY: closed lists; the fence and event are ours.
@@ -911,27 +916,15 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
+    /// The list's indirect-work budget, zeroed before each submission.
+    pub(crate) fn budget(&self) -> Option<&ID3D12Resource> {
+        self.budget
             .get_or_init(|| {
                 let (b, d) = host()?.shared_buffer(256)?;
                 Some((b, d as usize))
             })
-            .as_ref()?;
-        let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
-        }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+            .as_ref()
+            .map(|(buffer, _)| buffer)
     }
 
     /// Keeps `object` alive until the list is reset.
