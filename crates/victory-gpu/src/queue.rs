@@ -1,11 +1,16 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once, unless the queue waits for a fence
+//! value not reached yet: then its work is held back until it is (see
+//! [`crate::timeline`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::fence::Held;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+use crate::timeline::{Op, Timeline};
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
@@ -34,6 +39,8 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    /// The work, in order, held back behind waits.
+    timeline: Arc<Timeline>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -61,6 +68,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        timeline: Arc::default(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -110,20 +118,27 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+/// Runs the lists' host lists and waits for them (decision 0007), once
+/// the queue's waits before them are reached.
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
     #[cfg(windows)]
-    if let Some(host) = crate::host::host() {
+    if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // Held until they run: the title may reset its lists before.
         let host_lists: Vec<_> = lists
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        queue(this).timeline.submit(Op::Run(Box::new(move || {
+            if let Some(host) = crate::host::host() {
+                let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
+                host.execute(&runs);
+            }
+        })));
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -157,15 +172,27 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+/// Signals once the queue's work before it has run.
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+    let fence = Held::new(fence);
+    queue(this)
+        .timeline
+        .submit(Op::Run(Box::new(move || fence.signal(value))));
+    S_OK
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// Holds the queue's later work back until the fence reaches `value`; the
+/// caller does not wait.
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    queue(this)
+        .timeline
+        .submit(Op::Wait(Held::new(fence), value));
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -507,6 +534,48 @@ mod tests {
             7
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// Two queues: the first waits for a value the second signals later.
+    /// The first queue's signal after its wait must not complete before.
+    #[test]
+    fn work_after_a_wait_runs_once_the_other_queue_signals() {
+        type Call = extern "system" fn(This, This, u64) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut waits, mut signals) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut signals), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+
+        let signal = |q: This| slot::<Call>(q, signal_slot(q));
+        let wait = |q: This| slot::<Call>(q, signal_slot(q) + 8);
+        assert_eq!(wait(waits)(waits, ready, 1), S_OK);
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+        assert_eq!(completed(done), 0, "ran before the value was reached");
+
+        assert_eq!(signal(signals)(signals, ready, 1), S_OK);
+        assert_eq!(completed(done), 1);
+        // Not held any more: work runs when submitted again.
+        assert_eq!(signal(waits)(waits, done, 2), S_OK);
+        assert_eq!(completed(done), 2);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [waits, signals, ready, done] {
+            assert_eq!(release(object), 0);
+        }
     }
 
     /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.

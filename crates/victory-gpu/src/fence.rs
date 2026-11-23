@@ -1,19 +1,21 @@
-//! Fences: a 64-bit value and the events waiting for it. Three things move
-//! a value: the title's CPU signals, our queues' signals (submissions run
-//! to completion before they return, so a queue signals at once) and
-//! bottom-of-pipe writes a command list makes at the fence's GPU address.
-//! All three wake the waits, so an event or a blocking wait ends once the
-//! value it asked for is reached, whichever moved it.
+//! Fences: a 64-bit value and the events and queues waiting for it. Three
+//! things move a value: the title's CPU signals, our queues' signals (a
+//! queue's work runs to completion before its signal, so a queue not held
+//! back by a wait signals at once) and bottom-of-pipe writes a command list
+//! makes at the fence's GPU address. All three wake the waits, so an
+//! event, a blocking wait or a queue's wait ends once the value it asked
+//! for is reached, whichever moved it.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+use crate::timeline::Timeline;
 
 pub(crate) const FENCE_IIDS: [Iid; 4] = [
     guid(
@@ -39,6 +41,9 @@ struct Fence {
     /// Wakes blocking waits (`SetEventOnCompletion` with a null event)
     /// whenever the value moves.
     moved: Condvar,
+    /// Queues holding work back until the value reaches theirs
+    /// (`ID3D12CommandQueue::Wait`). Locked after `waiters`, never before.
+    queues: Mutex<Vec<(u64, Weak<Timeline>)>>,
 }
 
 impl Drop for Fence {
@@ -81,6 +86,7 @@ pub(crate) extern "system" fn create(
         flags,
         waiters: Mutex::new(Vec::new()),
         moved: Condvar::new(),
+        queues: Mutex::new(Vec::new()),
     });
     let at = (&raw const fence.value) as usize;
     live().insert(at, (&raw const *fence) as usize);
@@ -152,13 +158,16 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    wake(fence, waiters);
+    let queues = wake(fence, waiters);
+    run_held(queues);
     S_OK
 }
 
-/// Sets the events whose value the fence has reached and wakes the
-/// blocking waits.
-fn wake(fence: &Fence, mut waiters: MutexGuard<'_, Vec<(u64, usize)>>) {
+/// Sets the events whose value the fence has reached, wakes the blocking
+/// waits and returns the queues to wake, for [`run_held`] once no fence
+/// lock is held.
+#[must_use]
+fn wake(fence: &Fence, mut waiters: MutexGuard<'_, Vec<(u64, usize)>>) -> Vec<Arc<Timeline>> {
     let value = fence.value.load(Ordering::Acquire);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
@@ -168,6 +177,71 @@ fn wake(fence: &Fence, mut waiters: MutexGuard<'_, Vec<(u64, usize)>>) {
         !reached
     });
     fence.moved.notify_all();
+    let mut woken = Vec::new();
+    fence
+        .queues
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(wanted, queue)| {
+            if *wanted <= value {
+                woken.extend(queue.upgrade());
+                false
+            } else {
+                queue.strong_count() > 0
+            }
+        });
+    woken
+}
+
+/// Runs the work queues held back until a value now reached. With no fence
+/// lock held: the work may move fences itself.
+fn run_held(queues: Vec<Arc<Timeline>>) {
+    for queue in queues {
+        queue.wake();
+    }
+}
+
+/// A reference to a fence held by a queue's work, given back on drop.
+pub(crate) struct Held(This);
+
+// SAFETY: fences are made for use from many threads (the value is atomic,
+// the rest locked).
+unsafe impl Send for Held {}
+
+impl Held {
+    pub(crate) fn new(this: This) -> Held {
+        object::add_ref(this);
+        Held(this)
+    }
+
+    pub(crate) fn reached(&self, value: u64) -> bool {
+        fence(self.0).value.load(Ordering::Acquire) >= value
+    }
+
+    pub(crate) fn signal(&self, value: u64) {
+        signal(self.0, value);
+    }
+
+    /// Whether the value is reached; if not, `queue` is woken once it is.
+    /// Checked under the lock a signal takes, so no signal is missed.
+    pub(crate) fn wait_on_gpu(&self, value: u64, queue: &Arc<Timeline>) -> bool {
+        let fence = fence(self.0);
+        let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
+        if fence.value.load(Ordering::Acquire) >= value {
+            return true;
+        }
+        let queue = Arc::downgrade(queue);
+        if !queues.iter().any(|(v, q)| *v == value && q.ptr_eq(&queue)) {
+            queues.push((value, queue));
+        }
+        false
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        release(self.0);
+    }
 }
 
 /// After a bottom-of-pipe write of `bytes` at `at`: wakes the waits of a
@@ -184,10 +258,12 @@ pub(crate) fn written(at: usize, bytes: usize) {
     // SAFETY: registered fences are alive until their drop, which takes
     // the registry lock we hold.
     let fence = unsafe { &*(fence as *const Fence) };
-    wake(
+    let queues = wake(
         fence,
         fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
     );
+    drop(live);
+    run_held(queues);
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {
