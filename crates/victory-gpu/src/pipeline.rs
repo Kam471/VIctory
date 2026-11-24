@@ -214,32 +214,58 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_skip_hashes(value: &str, warn: bool) -> Vec<String> {
     value
-        .split(',')
+        .split([',', '\n', '\r', ' ', '\t'])
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
             } else {
-                tracing::warn!(
-                    hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
-                );
+                if warn {
+                    tracing::warn!(
+                        hash,
+                        "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+                    );
+                }
                 None
             }
         })
         .collect()
 }
 
+/// The shader hashes to skip: `VICTORY_SKIP_PIPELINES` (comma separated) and
+/// `VICTORY_SKIP_PIPELINES_FILE` (hashes separated by commas, spaces or
+/// lines; names and comments are ignored). The file form takes a whole
+/// shader family, which does not fit an environment variable.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_hashes() -> &'static std::collections::HashSet<String> {
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let mut hashes: std::collections::HashSet<String> = std::env::var("VICTORY_SKIP_PIPELINES")
+            .map(|value| parse_skip_hashes(&value, true))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(path) = std::env::var_os("VICTORY_SKIP_PIPELINES_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    hashes.extend(parse_skip_hashes(&text, false));
+                    tracing::info!(path = ?path, hashes = hashes.len(), "shader skip list loaded");
+                }
+                Err(error) => {
+                    tracing::warn!(path = ?path, %error, "cannot read the shader skip list");
+                }
+            }
+        }
+        hashes
+    })
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
+    let hashes = skip_hashes();
     if hashes.is_empty() {
         return None;
     }
@@ -506,10 +532,22 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_skip_hashes(" , ", true).is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            super::parse_skip_hashes(
+                " 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,",
+                true
+            ),
             ["0123456789abcdef", "0011223344556677"]
+        );
+        // The file form separates by lines and spaces too, and names are
+        // silently ignored.
+        assert_eq!(
+            super::parse_skip_hashes(
+                "37f363f0a5dcd806\n# a comment\nb0c25c474da417b3 0123456789abcdef",
+                false
+            ),
+            ["37f363f0a5dcd806", "b0c25c474da417b3", "0123456789abcdef"]
         );
     }
 
