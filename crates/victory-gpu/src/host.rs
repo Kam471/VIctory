@@ -586,8 +586,27 @@ impl Host {
                 unsafe { (*data as *mut u32).write_volatile(0) };
             }
         }
-        *submitted += 1;
         let prepared = std::time::Instant::now();
+        // The host's watchdog resets a device whose submission runs for about
+        // two seconds; a world frame's 30-odd lists add up to more than that,
+        // so runs go in small groups and the GPU drains between them.
+        const RUNS_PER_SUBMISSION: usize = 4;
+        let chunked = |max: usize| {
+            let mut groups: Vec<&[Option<ID3D12CommandList>]> = Vec::new();
+            let mut start = 0;
+            while start < runs.len() {
+                let end = (start + max).min(runs.len());
+                let from = firsts[start];
+                let to = if end < firsts.len() {
+                    firsts[end]
+                } else {
+                    lists.len()
+                };
+                groups.push(&lists[from..to]);
+                start = end;
+            }
+            groups
+        };
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -597,10 +616,10 @@ impl Host {
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            chunked(RUNS_PER_SUBMISSION)
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = chunked(RUNS_PER_SUBMISSION);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -619,7 +638,7 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -629,6 +648,12 @@ impl Host {
                 }
             }
             let _ = (i, started);
+            // A removed device cannot run the groups after this one; the
+            // report below names what was in flight.
+            // SAFETY: a plain query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                break;
+            }
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
