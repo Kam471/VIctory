@@ -522,3 +522,57 @@ fn pixel_shader_sgpr_spill_lowers_and_draws() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// Lane masks spilled to VGPR lanes and read back as the active mask (the
+/// console compiler's `v_writelane_b32` / `v_readlane_b32` spill) lower in
+/// both wave widths: each lane's bit is the one it had when spilled.
+#[test]
+fn pixel_shader_spilled_lane_mask_lowers_wave64_and_wave32() {
+    let outputs = vec![SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    }];
+    for wave64 in [false, true] {
+        let mut words = Vec::new();
+        words.push(0x7D84_0080); // v_cmp_eq_u32 vcc, 0, v0
+        words.extend_from_slice(&vop3_2(0x361, 5, sgpr(106), iconst(0)));
+        if wave64 {
+            words.extend_from_slice(&vop3_2(0x361, 5, sgpr(107), iconst(1)));
+            words.extend_from_slice(&vop3_2(0x360, 126, vgpr(5), iconst(0)));
+            words.extend_from_slice(&vop3_2(0x360, 127, vgpr(5), iconst(1)));
+        } else {
+            words.extend_from_slice(&vop3_2(0x360, 126, vgpr(5), iconst(0)));
+        }
+        words.push(vop1(0x001, 0, 242)); // v_mov_b32 v0, 1.0
+        words.push(vop1(0x001, 1, iconst(0)));
+        words.push(vop1(0x001, 2, iconst(0)));
+        words.push(vop1(0x001, 3, iconst(0)));
+        words.extend_from_slice(&exp_mrt0_done(0, 1, 2, 3));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code,
+        };
+        lower_and_validate(&native, outputs.clone(), None);
+    }
+}
