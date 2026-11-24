@@ -322,25 +322,53 @@ mod warp_tests {
     use super::*;
 
     #[test]
-    fn a_title_copy_forgets_only_the_host_copies_over_it() {
-        let refreshed = |start: usize, end: usize| Refreshed {
-            start,
-            end,
-            ranges: [(start, end - start)].into(),
-        };
+    fn a_title_copy_makes_an_identical_refresh_ask_only_for_the_copied_bytes() {
         let mut holds = Holds::default();
-        holds.refreshed.insert(1, refreshed(0x1000, 0x2000));
-        holds.refreshed.insert(2, refreshed(0x8000, 0x9000));
-
-        // A copy inside the first host copy's memory forgets only that one.
+        let bounds = (0x1000, 0x8000); // start, length: covers 0x1000..0x9000
+        // The first view of the copy asks for all of it.
+        assert_eq!(holds.note(1, bounds, 0x1000, 0x8000), [(0x1000, 0x9000)]);
+        // The same view again asks for nothing.
+        assert!(holds.note(1, bounds, 0x1000, 0x8000).is_empty());
+        // A small title copy inside invalidates only the copied bytes.
         holds.copied(0x1800, 0x100);
-        assert!(!holds.refreshed.contains_key(&1));
-        assert!(holds.refreshed.contains_key(&2));
+        assert_eq!(holds.note(1, bounds, 0x1000, 0x8000), [(0x1800, 0x1900)]);
+        // Once refreshed, the same view is quiet again.
+        assert!(holds.note(1, bounds, 0x1000, 0x8000).is_empty());
+        // Another small copy asks for just that piece, not the 32 KiB around it.
+        holds.copied(0x5000, 0x200);
+        assert_eq!(holds.note(1, bounds, 0x1000, 0x8000), [(0x5000, 0x5200)]);
+    }
 
-        // A copy that ends where it starts does not touch it.
-        holds.refreshed.insert(1, refreshed(0x1000, 0x2000));
-        holds.copied(0x2000, 0x100);
-        assert!(holds.refreshed.contains_key(&1));
+    #[test]
+    fn a_copy_inside_a_wide_host_copy_keeps_other_views_current() {
+        let mut holds = Holds::default();
+        let bounds = (0x1000, 0x8000);
+        assert_eq!(holds.note(1, bounds, 0x1000, 0x8000), [(0x1000, 0x9000)]);
+        assert_eq!(holds.note(1, bounds, 0x2000, 0x1000), [(0x2000, 0x3000)]);
+        // The copy is outside the second view: that view stays current and
+        // the wide view asks only for the copied bytes.
+        holds.copied(0x1800, 0x100);
+        assert!(holds.note(1, bounds, 0x2000, 0x1000).is_empty());
+        assert_eq!(holds.note(1, bounds, 0x1000, 0x8000), [(0x1800, 0x1900)]);
+    }
+
+    #[test]
+    fn take_covered_splits_a_range_around_the_bytes_taken() {
+        let mut ranges = vec![(0x1000, 0x9000)];
+        assert_eq!(
+            take_covered(&mut ranges, 0x1800, 0x1900),
+            [(0x1800, 0x1900)]
+        );
+        assert_eq!(ranges, [(0x1000, 0x1800), (0x1900, 0x9000)]);
+        assert_eq!(
+            take_covered(&mut ranges, 0x1000, 0x9000),
+            [(0x1000, 0x1800), (0x1900, 0x9000)]
+        );
+        assert!(ranges.is_empty());
+        // Touching ranges join again.
+        merge(&mut ranges, 0x1900, 0x2000);
+        merge(&mut ranges, 0x1000, 0x1900);
+        assert_eq!(ranges, [(0x1000, 0x2000)]);
     }
 
     #[test]
@@ -571,44 +599,120 @@ struct Refreshed {
     /// Title memory the host copy covers.
     start: usize,
     end: usize,
-    /// Refreshed ranges (address, bytes).
+    /// Refreshed ranges `(start, end)`.
     ranges: std::collections::HashSet<(usize, usize)>,
+    /// Bytes a title copy overwrote since those ranges were refreshed,
+    /// sorted and disjoint. An identical refresh asks only for these; the
+    /// rest of the range is still current, so a small upload ring inside a
+    /// wide host copy no longer makes the whole copy be scanned again.
+    copied: Vec<(usize, usize)>,
 }
 
 impl Holds {
-    /// Notes that `[address, address + len)` of `shadow` is refreshed;
-    /// false if it already was.
+    /// Notes that `[address, address + len)` of `shadow` is refreshed and
+    /// returns the parts still to refresh: nothing if the exact range was
+    /// refreshed and not copied over, or only the bytes a title copy
+    /// overwrote since.
     fn note(
         &mut self,
-        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        key: usize,
+        bounds: (usize, usize),
         address: usize,
         len: usize,
-    ) -> bool {
-        let (start, length) = shadow.bounds();
-        self.refreshed
-            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-            .or_insert_with(|| Refreshed {
-                start,
-                end: start.saturating_add(length),
-                ranges: Default::default(),
-            })
-            .ranges
-            .insert((address, len))
+    ) -> Vec<(usize, usize)> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let end = address.saturating_add(len);
+        let (start, length) = bounds;
+        let refresh = self.refreshed.entry(key).or_insert_with(|| Refreshed {
+            start,
+            end: start.saturating_add(length),
+            ..Refreshed::default()
+        });
+        if refresh.ranges.contains(&(address, end)) {
+            return take_covered(&mut refresh.copied, address, end);
+        }
+        // A first refresh of this range takes the whole range, copied bytes
+        // included, so it can forget them.
+        take_covered(&mut refresh.copied, address, end);
+        refresh.ranges.insert((address, end));
+        vec![(address, end)]
     }
 
     /// A title copy into `[at, at + len)` changes what a refresh would find
-    /// only for the host copies over that memory: forget those, keep the
-    /// others (the world copies into small upload rings every frame, which
-    /// used to throw away every refresh in the title list).
+    /// only where it copied: remember those bytes for the identical
+    /// refreshes still to come, and keep the rest of the host copy current.
     fn copied(&mut self, at: usize, len: usize) {
         let end = at.saturating_add(len);
-        self.refreshed.retain(|_, r| r.end <= at || r.start >= end);
+        for refresh in self.refreshed.values_mut() {
+            if refresh.end <= at || refresh.start >= end {
+                continue;
+            }
+            merge(
+                &mut refresh.copied,
+                at.max(refresh.start),
+                end.min(refresh.end),
+            );
+        }
     }
 
     fn clear(&mut self) {
         self.refreshed.clear();
         self.textures.clear();
     }
+}
+
+/// Removes and returns the parts of `[from, to)` covered by the sorted,
+/// disjoint `ranges`, shortening the ranges around them.
+fn take_covered(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut taken = Vec::new();
+    let mut kept = Vec::new();
+    for &(start, end) in ranges.iter() {
+        if end <= from || start >= to {
+            kept.push((start, end));
+            continue;
+        }
+        let (inside, outside) = (start.max(from), end.min(to));
+        taken.push((inside, outside));
+        if start < inside {
+            kept.push((start, inside));
+        }
+        if outside < end {
+            kept.push((outside, end));
+        }
+    }
+    *ranges = kept;
+    taken
+}
+
+/// Adds `[from, to)` to the sorted, disjoint `ranges`, joining overlaps and
+/// touching ranges.
+fn merge(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let (mut from, mut to) = (from, to);
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    let mut placed = false;
+    for &(start, end) in ranges.iter() {
+        if end < from {
+            out.push((start, end));
+        } else if start > to {
+            if !placed {
+                out.push((from, to));
+                placed = true;
+            }
+            out.push((start, end));
+        } else {
+            from = from.min(start);
+            to = to.max(end);
+        }
+    }
+    if !placed {
+        out.push((from, to));
+    }
+    *ranges = out;
 }
 
 /// Whether a split list keeps the refreshes of the list it continues
@@ -1458,15 +1562,17 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         // Lock order: deferred, then holds (see `defer_copy`).
-        let first = self
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let bounds = shadow.bounds();
+        let parts = self
             .holds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .note(shadow, address, len);
-        if first {
+            .note(key, bounds, address, len);
+        for (from, to) in parts {
             deferred
                 .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+                .push(Step::Refresh(shadow.clone(), from, to - from));
         }
     }
 
