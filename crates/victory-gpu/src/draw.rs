@@ -187,8 +187,9 @@ fn fallback_root_va(uav: bool) -> Option<u64> {
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory. Constant buffers refresh up to the D3D12 64 KiB
-/// maximum; SRVs and UAVs refresh the full remaining extent of the backing
-/// buffer (dirty-page watched) and UAVs also schedule write-back.
+/// maximum; SRVs and UAVs refresh up to [`ROOT_SRV_MAX`] / [`ROOT_UAV_MAX`]
+/// of the backing buffer (dirty-page watched) and UAVs also schedule
+/// write-back of that range (see [`root_len`]).
 fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     if address == 0 {
         return None;
@@ -197,7 +198,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     let gpu = shadow.gpu(address);
     match kind {
         RootView::Cbv => {
-            let len = shadow.left(address).min(1 << 16);
+            let len = root_len(shadow.left(address), RootView::Cbv);
             if gpu.is_multiple_of(256) {
                 shadow.refresh(list, address, len);
                 return Some(gpu);
@@ -210,7 +211,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             if !gpu.is_multiple_of(4) {
                 return None;
             }
-            let len = shadow.left(address);
+            let len = root_len(shadow.left(address), RootView::Srv);
             shadow.refresh(list, address, len);
             Some(gpu)
         }
@@ -218,7 +219,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             if !gpu.is_multiple_of(4) {
                 return None;
             }
-            let len = shadow.left(address);
+            let len = root_len(shadow.left(address), RootView::Uav);
             shadow.refresh(list, address, len);
             shadow.gpu_writes(list, address, len);
             Some(gpu)
@@ -245,6 +246,35 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Largest root SRV range refreshed per bind.
+const ROOT_SRV_MAX: u64 = 4 << 20;
+/// Largest root UAV range refreshed, kept and copied back per submission.
+const ROOT_UAV_MAX: u64 = 2 << 20;
+
+/// The bytes of a root view's buffer copy (`left` remaining after its
+/// address) that a bind refreshes: constant buffers up to the D3D12 64 KiB
+/// maximum, SRVs and UAVs up to their caps, warning once when a cap cuts.
+///
+/// shortcut: a root view has no size, and the translated shader does not
+/// yet report the range it reads or writes, so SRVs and UAVs are capped
+/// rather than taking the rest of the copy: behind most title buffers is
+/// one host copy of well over 100 MiB, and a UAV's range is kept and
+/// compared on every submission. The UAV cap is the smaller for that.
+fn root_len(left: u64, kind: RootView) -> u64 {
+    let cap = match kind {
+        RootView::Cbv => return left.min(1 << 16),
+        RootView::Srv => ROOT_SRV_MAX,
+        RootView::Uav => ROOT_UAV_MAX,
+    };
+    if left > cap {
+        match kind {
+            RootView::Srv => once!(left, cap, "a root SRV cut to its refresh cap"),
+            _ => once!(left, cap, "a root UAV cut to its refresh and copy-back cap"),
+        }
+    }
+    left.min(cap)
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -2045,6 +2075,18 @@ mod root_view_tests {
         assert!(zero_va.is_multiple_of(256));
         assert!(sink_va.is_multiple_of(256));
         list.close();
+    }
+
+    #[test]
+    fn root_view_ranges_are_capped() {
+        let big = 1 << 30;
+        assert_eq!(root_len(big, RootView::Cbv), 64 << 10);
+        assert_eq!(root_len(big, RootView::Srv), ROOT_SRV_MAX);
+        assert_eq!(root_len(big, RootView::Uav), ROOT_UAV_MAX);
+        // A shorter remaining extent is taken whole.
+        for kind in [RootView::Cbv, RootView::Srv, RootView::Uav] {
+            assert_eq!(root_len(4096, kind), 4096);
+        }
     }
 
     #[test]
