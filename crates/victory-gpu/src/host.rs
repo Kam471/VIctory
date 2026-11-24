@@ -2331,7 +2331,7 @@ fn pump() {
 }
 
 #[cfg(test)]
-mod tests {
+mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
 
