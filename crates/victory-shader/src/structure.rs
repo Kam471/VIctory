@@ -545,7 +545,7 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                self.when[b] = Some(self.branch(b, last));
             }
         }
         execs
@@ -1066,13 +1066,104 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The uniform condition under which `s_andn2_b64` / `s_and_b64` of EXEC
+    /// with `s[a:b]` is nonzero, when `s[a:b]` is EXEC or 0 chosen by a
+    /// uniform SCC (`s_cselect_b64 s[a:b], exec, 0`). EXEC is wave-wide and
+    /// the choice is uniform, so the result is either 0 or EXEC for the whole
+    /// wave: the branch is uniform even though its mask is not.
+    fn uniform_exec_and(&mut self, block: usize, inst: &Inst) -> Option<Bool> {
+        let exec_op = |op: &Operand| matches!(op, Operand::Scalar { code, .. } if *code == EXEC);
+        let zero = |op: &Operand| matches!(op, Operand::Const(128) | Operand::Literal(0));
+        let vcc = inst.read(Reg::S(VCC))?;
+        let &(b, i) = self.defs.get(&vcc)?;
+        let def = &self.p.blocks[b].insts[i];
+        let Fields::Sop { src, .. } = &def.fields else {
+            return None;
+        };
+        let (and, mask) = match (def.name(), src.get(0)?, src.get(1)?) {
+            ("s_and_b64", a, m) | ("s_andn2_b64", a, m) => {
+                if !exec_op(a) {
+                    return None;
+                }
+                (def.name() == "s_and_b64", m)
+            }
+            _ => return None,
+        };
+        let Operand::Scalar { code, .. } = *mask else {
+            return None;
+        };
+        let lo = def.read(Reg::S(code))?;
+        let hi = if self.p.wave64 {
+            def.read(Reg::S(code + 1))?
+        } else {
+            lo
+        };
+        let (lb, li) = *self.defs.get(&lo)?;
+        let (hb, hi_i) = *self.defs.get(&hi)?;
+        if (lb, li) != (hb, hi_i) {
+            return None;
+        }
+        let csel = &self.p.blocks[lb].insts[li];
+        let Fields::Sop { src: csrc, .. } = &csel.fields else {
+            return None;
+        };
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        if csel.name() != format!("s_cselect{width}") {
+            return None;
+        }
+        let exec_first = match (csrc.get(0)?, csrc.get(1)?) {
+            (e, z) if exec_op(e) && zero(z) => true,
+            (z, e) if zero(z) && exec_op(e) => false,
+            _ => return None,
+        };
+        // EXEC must not change between the choice and the branch (the branch
+        // itself does not read EXEC in the IR), or the choice no longer
+        // names the whole active wave.
+        let last = self.p.blocks[block].insts.len().checked_sub(1)?;
+        if b != block || i >= last {
+            return None;
+        }
+        let writes_exec = |inst: &Inst| {
+            inst.write(Reg::S(EXEC)).is_some() || inst.write(Reg::S(EXEC + 1)).is_some()
+        };
+        let insts = &self.p.blocks[block].insts;
+        if lb == block && (li >= i || insts[li + 1..i].iter().any(writes_exec)) {
+            return None;
+        }
+        if insts[i + 1..last].iter().any(writes_exec) {
+            return None;
+        }
+        if self.exec(csel) != self.exec(def) {
+            return None;
+        }
+        let scc = csel.read(Reg::Scc)?;
+        let u = match self.scc_lane.get(&scc).copied() {
+            Some(m) => m,
+            None => {
+                let born = self.born(scc);
+                self.b.atom(Atom::Uniform(scc), born)
+            }
+        };
+        // `exec & ~s` with s = exec/0 is nonzero under !u when the choice
+        // takes EXEC first, and under u otherwise (`exec & s` is the other
+        // way round).
+        Some(if and == exec_first {
+            u
+        } else {
+            self.b.not(u)
+        })
+    }
+
     /// The per-lane condition under which a block's closing branch is taken.
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    fn branch(&mut self, block: usize, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
+                if let Some(u) = self.uniform_exec_and(block, inst) {
+                    return if n.ends_with("nz") { u } else { self.b.not(u) };
+                }
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
@@ -1275,6 +1366,36 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    /// `s_andn2_b64 vcc, exec, s[14:15]` and `s_and_b64 vcc, exec, s[14:15]`
+    /// where `s[14:15]` is EXEC or 0 chosen by a uniform SCC: the result is
+    /// 0 or EXEC for the whole wave, so the branch is uniform even though its
+    /// mask is not.
+    #[test]
+    fn exec_and_a_uniform_choice_branches_uniformly() {
+        for op in [0x8AEA0E7E, 0x87EA0E7E] {
+            let p = build(
+                &[
+                    0xBF06_810E, // s_cmp_eq_u32 s14, 1
+                    0x858E_807E, // s_cselect_b64 s[14:15], exec, 0
+                    op,          // s_andn2_b64 / s_and_b64 vcc, exec, s[14:15]
+                    0xBF87_0001, // s_cbranch_vccnz +1
+                    0xBF80_0000, // s_nop
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("branch not structured");
+            };
+            let support = s.bools.support(when);
+            assert!(
+                support.iter().all(|a| matches!(a, Atom::Uniform(_))),
+                "{support:?}"
+            );
+        }
     }
 
     #[test]
