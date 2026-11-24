@@ -1739,9 +1739,8 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet: done before a step that writes
+/// title memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -1749,22 +1748,56 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Spans)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
+/// The ranges of one buffer copy still to refresh. Ranges far apart stay
+/// apart: the kernel scans every page of a range it is asked about, so the
+/// bounding range of scattered reads would scan the unchanged memory
+/// between them. Ranges that overlap or are at most one page apart join:
+/// the extra page costs less than another kernel ask.
+#[derive(Default)]
+struct Spans(Vec<(usize, usize)>);
+
+impl Spans {
+    /// Ranges with a gap of at most one page between them join.
+    const JOIN: usize = crate::watch::PAGE;
+
+    fn add(&mut self, address: usize, len: usize) {
+        let (mut from, mut to) = (address, address + len);
+        let mut i = 0;
+        while i < self.0.len() {
+            let (a, b) = self.0[i];
+            // `to` and `from` grow as spans join, so ranges already seen are
+            // tested again after a removal.
+            if a <= to.saturating_add(Self::JOIN) && from <= b.saturating_add(Self::JOIN) {
+                from = from.min(a);
+                to = to.max(b);
+                self.0.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        self.0.push((from, to));
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        match self
+        let at = self
             .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
-        }
+            .iter()
+            .position(|(s, _)| std::sync::Arc::ptr_eq(s, shadow));
+        let spans = match at {
+            Some(i) => &mut self.refreshes[i].1,
+            None => {
+                self.refreshes.push((shadow.clone(), Spans::default()));
+                &mut self.refreshes.last_mut().expect("just pushed").1
+            }
+        };
+        spans.add(address, len);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -1782,14 +1815,16 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, spans) in self.refreshes.drain(..) {
+            for (from, to) in spans.0 {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -2772,8 +2807,51 @@ fn pump() {
 #[cfg(test)]
 mod batch {
     // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, Spans};
     use std::sync::Arc;
+
+    /// The point of keeping spans apart: a watch scans every page of the
+    /// range it is given, so a range over a gap scans memory no draw reads.
+    #[test]
+    fn far_apart_ranges_stay_apart() {
+        let mut spans = Spans::default();
+        spans.add(0x10_0000, 0x10_0000); // 1 MiB
+        spans.add(0x50_0000, 0x1000);
+        assert_eq!(spans.0, [(0x10_0000, 0x20_0000), (0x50_0000, 0x50_1000)]);
+    }
+
+    /// Sixteen small reads spread over 16 MiB: the watches cover the reads,
+    /// not the 16 MiB a bounding range would scan.
+    #[test]
+    fn scattered_ranges_scan_only_their_own_bytes() {
+        let mut spans = Spans::default();
+        for i in 0..16 {
+            spans.add(0x10_0000 + i * (1 << 20), 0x1000);
+        }
+        assert_eq!(spans.0.len(), 16);
+        let planned: usize = spans.0.iter().map(|(from, to)| to - from).sum();
+        assert_eq!(planned, 16 * 0x1000);
+    }
+
+    #[test]
+    fn overlapping_and_touching_ranges_join() {
+        let mut spans = Spans::default();
+        spans.add(0x10_0000, 0x20_0000);
+        spans.add(0x20_0000, 0x10_0000); // touches the end
+        spans.add(0x15_0000, 0x1000); // inside
+        assert_eq!(spans.0, [(0x10_0000, 0x30_0000)]);
+    }
+
+    #[test]
+    fn ranges_one_page_apart_join_and_chain() {
+        let mut spans = Spans::default();
+        spans.add(0x10_0000, 0x10_0000);
+        spans.add(0x30_0000, 0x10_0000);
+        // One page (64 KiB) of gap between them: one more page scanned
+        // instead of another kernel ask.
+        spans.add(0x20_0000 + (64 << 10), 0x10_0000);
+        assert_eq!(spans.0, [(0x10_0000, 0x40_0000)]);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
