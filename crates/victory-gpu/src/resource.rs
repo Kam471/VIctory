@@ -847,27 +847,59 @@ fn host_texture(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
+        // A clear value is only legal on render targets and depth.
+        let clear = clear_value
+            .as_ref()
+            .filter(|_| d.flags & (1 | DEPTH) != 0)
+            .map(|v| std::ptr::from_ref(v).cast());
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(
+                    d.flags,
+                    crate::host::texture_state(state),
+                ) as i32),
+                // The same layout: format, then color or depth and stencil.
+                clear,
+                texture,
+            )
+        }
     };
+    let mut made = create(&d, &mut texture);
+    // Not every host GPU offers every use of every format (NVIDIA: no
+    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
+    // console's AMD GPU has both). Give up the uses the host refuses, UAV
+    // first; the views the host cannot make are skipped as for depth.
+    for drop in [UNORDERED, 1] {
+        if made.is_ok() || d.flags & drop == 0 {
+            continue;
+        }
+        let mut fewer = d;
+        fewer.flags &= !drop;
+        let mut retry: Option<ID3D12Resource> = None;
+        if create(&fewer, &mut retry).is_ok() {
+            tracing::warn!(desc = ?d, dropped = drop, "host texture without a use the host refuses");
+            d = fewer;
+            texture = retry;
+            made = Ok(());
+        } else if drop == UNORDERED {
+            d = fewer; // also try with neither
+        }
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
@@ -1348,6 +1380,43 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+#[cfg(test)]
+pub(crate) fn test_buffer(width: u64) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
 
 #[cfg(test)]
 mod tests {
