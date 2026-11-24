@@ -3746,7 +3746,7 @@ impl<'a> Lower<'a> {
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
+    // stops the program. A cube reads as its six faces (not a cube array).
     /// Two scalar loads of the same dwords: same opcode and immediate
     /// offset, base read from the same values, and the same or an
     /// equivalent register offset.
@@ -3890,9 +3890,10 @@ impl<'a> Lower<'a> {
                     0 => 1,
                     1 => 2,
                     2 => 4,
+                    3 => 5,
                     4 => 6,
                     5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+                    _ => return Err("an image dimension (MSAA)"),
                 };
                 // As `image` annotates it: atomics on one 32-bit integer
                 // channel (also for 64-bit atomics, as DXC does).
@@ -3954,6 +3955,8 @@ impl<'a> Lower<'a> {
                     1 => (one, one),
                     2 => (field(self, 1), one),
                     6 => (one, field(self, 1)),
+                    // A cube is six faces (DXIL's dimensions have no depth).
+                    5 => (field(self, 1), self.s.m.i32(6)),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
@@ -3977,7 +3980,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
                 let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                let ty = [0, 8, 9, 0, 10, 11, 12, 13][kind as usize];
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
@@ -8264,22 +8267,22 @@ impl<'a> Lower<'a> {
 mod tests {
     use super::super::container::SigElement;
     use super::{Numeric, Parts, SubDword, buffer_format, inline_f16, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+    fn lowers(words: &[u32], layout: Vec<RootParam>) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
             vgprs: 256,
-            layout: vec![],
+            layout,
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
+                rsrc2: 1 << 1,
                 threads: [1, 1, 1],
             }),
             code,
@@ -8394,7 +8397,7 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
-            lowers(&words).unwrap();
+            lowers(&words, vec![]).unwrap();
         }
     }
 
@@ -8505,9 +8508,10 @@ mod tests {
         ];
         for head in [&b32[..], &k32[..], &b64[..]] {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words).unwrap();
+            lowers(&words, vec![]).unwrap();
         }
     }
+
     /// An f16 (sign, 5-bit exponent, 10-bit fraction) as an f32; normal numbers only.
     fn f16_value(h: u32) -> f32 {
         let sign = if h >> 15 != 0 { -1.0 } else { 1.0 };
@@ -8528,6 +8532,38 @@ mod tests {
                 "inline constant {code}: f32 {f32_value}, f16 {f16_value}"
             );
         }
+    }
+
+    #[test]
+    fn cube_descriptor_dwords_read_as_data() {
+        // A cube image's descriptor (a table range at s0) is loaded, sized
+        // with image_get_resinfo, and its depth dword (4: the six faces, so
+        // 5) is read as a number and branched on.
+        let table = RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+            0x7E04_0480, // v_mov_b32 v2, 0
+            0xF038_0318,
+            0x0001_0402, // image_get_resinfo v[4:5], v2, s[4:11] dim:SQ_RSRC_IMG_CUBE
+            0xBF06_8508, // s_cmp_eq_u32 s8, 5
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        lowers(&words, vec![table]).unwrap();
+        // The same with a 2D image (dim 1) also lowers.
+        let mut flat = words;
+        flat[4] = 0xF038_0308;
+        lowers(&flat, vec![table]).unwrap();
     }
 
     #[test]
