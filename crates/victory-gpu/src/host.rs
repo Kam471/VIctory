@@ -46,6 +46,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// Wave sizes reported by `D3D12_FEATURE_D3D12_OPTIONS1` (`None` if unavailable).
+    pub(crate) wave_range: Option<victory_shader::emit::WaveRange>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -222,9 +224,16 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         let wave64_mode = recommended_wave64_mode(&device);
         crate::shader_cache::set_wave64_mode(wave64_mode);
-        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
+        let wave_range = wave_range(&device);
+        crate::shader_cache::set_wave_range(wave_range);
+        tracing::info!(
+            ?wave64_mode,
+            ?wave_range,
+            "Wave64 compute lowering mode selected"
+        );
         Ok(Host {
             device,
+            wave_range,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -266,6 +275,28 @@ fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave6
     }
 }
 
+/// Wave sizes the device reports (`None` when wave operations are unavailable
+/// or the query fails).
+fn wave_range(device: &ID3D12Device) -> Option<victory_shader::emit::WaveRange> {
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain D3D12 feature query with valid struct size.
+    let ok = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            )
+            .is_ok()
+    };
+    (ok && opts.WaveOps.as_bool() && opts.WaveLaneCountMin > 0
+        && opts.WaveLaneCountMin <= opts.WaveLaneCountMax)
+        .then_some(victory_shader::emit::WaveRange {
+            min: opts.WaveLaneCountMin,
+            max: opts.WaveLaneCountMax,
+        })
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -289,7 +320,7 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 }
 
 #[cfg(test)]
-mod tests {
+mod warp_tests {
     use super::*;
 
     #[test]

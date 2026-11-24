@@ -14,13 +14,17 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, TranslateOptions, UserData, Wave64Mode};
+use victory_shader::emit::{
+    HostShader, StaticSampler, TranslateOptions, UserData, Wave64Mode, WaveRange,
+};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static WAVE64_MODE: AtomicU8 = AtomicU8::new(0);
+/// `(min << 32) | max`; zero when the device reports no wave range.
+static WAVE_RANGE: AtomicU64 = AtomicU64::new(0);
 
 fn mode_byte(mode: Wave64Mode) -> u8 {
     match mode {
@@ -34,6 +38,21 @@ fn mode_byte(mode: Wave64Mode) -> u8 {
 #[cfg(windows)]
 pub(crate) fn set_wave64_mode(mode: Wave64Mode) {
     WAVE64_MODE.store(mode_byte(mode), Ordering::Relaxed);
+}
+
+/// Records the wave sizes the host device reports (part of the cache key).
+#[cfg(windows)]
+pub(crate) fn set_wave_range(range: Option<WaveRange>) {
+    let packed = range.map_or(0, |r| (u64::from(r.min) << 32) | u64::from(r.max));
+    WAVE_RANGE.store(packed, Ordering::Relaxed);
+}
+
+fn effective_wave_range() -> Option<WaveRange> {
+    let packed = WAVE_RANGE.load(Ordering::Relaxed);
+    (packed != 0).then_some(WaveRange {
+        min: (packed >> 32) as u32,
+        max: packed as u32,
+    })
 }
 
 fn effective_wave64_mode() -> Wave64Mode {
@@ -111,12 +130,14 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let wave64 = effective_wave64_mode();
-    let options = TranslateOptions { wave64 };
+    let options = TranslateOptions {
+        wave64: effective_wave64_mode(),
+        host_waves: effective_wave_range(),
+    };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), wave64, container, translate),
+        Some(cache) => cached(cache, build(), options, container, translate),
         None => translate(container),
     }
 }
@@ -146,12 +167,16 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
-    mode: Wave64Mode,
+    options: TranslateOptions,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let mb = [mode_byte(mode)];
-    let input = [&build[..], &mb[..], container].concat();
+    let mode = [mode_byte(options.wave64)];
+    let waves = match options.host_waves {
+        Some(r) => [1, 0, 0, 0, r.min.to_le_bytes(), r.max.to_le_bytes()].concat(),
+        None => vec![0],
+    };
+    let input = [&build[..], &mode[..], &waves[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -340,6 +365,14 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    fn opts(wave64: Wave64Mode) -> TranslateOptions {
+        TranslateOptions {
+            wave64,
+            host_waves: None,
+        }
+    }
+
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -376,25 +409,25 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
             Ok(shader())
         );
         assert_eq!(
-            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another Wave64 mode translates separately.
         assert_eq!(
-            cached(&cache, &build, Wave64Mode::Wave32, container, translate),
+            cached(&cache, &build, opts(Wave64Mode::Wave32), container, translate),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // Another build translates again.
         assert_eq!(
-            cached(&cache, &[8; 32], Wave64Mode::Native, container, translate),
+            cached(&cache, &[8; 32], opts(Wave64Mode::Native), container, translate),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -404,19 +437,19 @@ mod tests {
             std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(
-            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 4);
         assert_eq!(
-            cached(&cache, &build, Wave64Mode::Native, container, translate),
+            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 4);
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, Wave64Mode::Native, b"other", fail).is_err());
+        assert!(cached(&cache, &build, opts(Wave64Mode::Native), b"other", fail).is_err());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

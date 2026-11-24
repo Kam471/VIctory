@@ -174,6 +174,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
         prims: Vec::new(),
         mesh_stride: 0,
         options: Default::default(),
+        host_waves: None,
     })
     .map_err(|e| format!("{e:?}"))?;
 
@@ -1161,6 +1162,7 @@ fn build_root_srv_cs(body: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         options: Default::default(),
+        host_waves: None,
     })
     .expect("lower");
 
@@ -1428,6 +1430,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         options: Default::default(),
+        host_waves: None,
     })
     .expect("lower");
 

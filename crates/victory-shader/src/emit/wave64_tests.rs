@@ -220,7 +220,7 @@ fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, Shade
         &st,
         &io_res,
         &res,
-        TranslateOptions { wave64: mode },
+        TranslateOptions { wave64: mode, ..Default::default() },
     )
 }
 
@@ -431,6 +431,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Native,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -439,6 +440,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Wave32,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -447,6 +449,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Emulate,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -637,7 +640,7 @@ mod gpu {
             &st,
             &io,
             &res,
-            TranslateOptions { wave64: mode },
+            TranslateOptions { wave64: mode, ..Default::default() },
         )
     }
 
@@ -1312,7 +1315,7 @@ mod gpu {
             [1, 1, 1],
             32,
             &expected,
-            true,
+            false,
         );
     }
 

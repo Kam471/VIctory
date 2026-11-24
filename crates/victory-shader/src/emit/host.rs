@@ -98,7 +98,7 @@ impl Host {
         }
     }
 
-    /// Wave-operation support and `(min, max)` hardware lane counts.
+   /// Wave-operation support and `(min, max)` hardware lane counts.
     pub fn wave_lanes(&self) -> (bool, u32, u32) {
         let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         // SAFETY: plain D3D12 feature query with valid struct size.
@@ -118,6 +118,13 @@ impl Host {
             opts.WaveLaneCountMin,
             opts.WaveLaneCountMax,
         )
+    }
+
+    /// Wave sizes the host device reports via `D3D12_FEATURE_D3D12_OPTIONS1`,
+    /// or `None` when wave operations are unavailable or the query fails.
+    pub fn wave_range(&self) -> Option<super::WaveRange> {
+        let (ops, min, max) = self.wave_lanes();
+        (ops && min > 0 && min <= max).then_some(super::WaveRange { min, max })
     }
 
     /// Whether the host supports compute shaders requiring 64-lane waves.

@@ -393,6 +393,7 @@ fn translate(
                             .map_or(emit::Wave64Mode::Native, |(h, _)| {
                                 h.recommended_wave64_mode()
                             }),
+                        host_waves: checks.host.as_ref().and_then(|(h, _)| h.wave_range()),
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {

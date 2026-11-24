@@ -70,6 +70,8 @@ pub(crate) struct Parts<'a> {
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
     pub options: TranslateOptions,
+    /// Wave sizes supported by the target host GPU (`None`: console wave size).
+    pub host_waves: Option<super::WaveRange>,
 }
 
 enum Stop {
@@ -290,12 +292,26 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// `v_readlane_b32` sites reading an SGPR spilled via `v_writelane_b32`,
+    /// resolved directly in SSA without wave operations.
+    resolved_reads: HashMap<Site, Spill>,
+    /// `v_writelane_b32` sites whose VGPR result is consumed only by resolved
+    /// `v_readlane_b32` sites (or other pure spill writes/phis).
+    pure_spill_writes: HashSet<Site>,
     /// Headers of loops that only wait for memory to change: they stop
     /// at [`super::spin_limit`] instead.
     spin: HashSet<usize>,
     /// Back edges given the spin-wait limit.
     #[cfg(test)]
     spun: usize,
+}
+
+/// A scalar value spilled into a VGPR lane by `v_writelane_b32` and read
+/// back by `v_readlane_b32` at the same constant lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spill {
+    Value(Value),
+    Const(u32),
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -842,7 +858,7 @@ fn compute_uniformity(
                 }
             }
         }
-        if next_blocks != blocks {
+       if next_blocks != blocks {
             blocks = next_blocks;
             changed = true;
         }
@@ -904,6 +920,246 @@ fn operand_const_lane(op: &Operand) -> Option<u32> {
     }
 }
 
+/// Constant lane index, masked to the hardware's low bits (`lane & 63` in
+/// Wave64, `lane & 31` in Wave32) so aliased lanes such as 67 and 3 compare equal.
+fn const_lane(op: Operand, wave64: bool) -> Option<u32> {
+    let raw = match op {
+        Operand::Const(c) => crate::resource::inline(c)?,
+        Operand::Literal(x) => x,
+        _ => return None,
+    };
+    Some(raw & if wave64 { 63 } else { 31 })
+}
+
+/// Resolves SGPR spills through VGPR lanes (`v_writelane_b32` ->
+/// `v_readlane_b32` at a constant lane) directly in SSA, and identifies the
+/// `v_writelane_b32` sites whose VGPR output never escapes to any other use.
+fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSet<Site>) {
+    let mut def_site: HashMap<Value, Site> = HashMap::new();
+    let mut def_block: HashMap<Value, usize> = HashMap::new();
+    let mut phi_at: HashMap<Value, (usize, usize)> = HashMap::new();
+    for &(_, v) in &p.inputs {
+        def_block.insert(v, 0);
+    }
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            phi_at.insert(phi.value, (b, i));
+            def_block.insert(phi.value, b);
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, w) in &inst.writes {
+                def_site.insert(w, (b, i));
+                def_block.insert(w, b);
+            }
+        }
+    }
+
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        rpo[b] = n;
+    }
+    let idom = crate::ir::idoms(&p.blocks, &order, &rpo);
+    let dominates = |a: usize, mut b: usize| -> bool {
+        if rpo[a] == usize::MAX || rpo[b] == usize::MAX {
+            return false;
+        }
+        while b != a {
+            let d = idom[b];
+            if d == b || d == usize::MAX {
+                return false;
+            }
+            b = d;
+        }
+        true
+    };
+
+    fn walk(
+        p: &Program,
+        st: &Structured,
+        def_site: &HashMap<Value, Site>,
+        phi_at: &HashMap<Value, (usize, usize)>,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Spill>, ()> {
+        if let Some(&(b, i)) = phi_at.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &arg in &p.blocks[b].phis[i].args {
+                if let Some(m) = walk(p, st, def_site, phi_at, arg, lane, seen)? {
+                    if found.is_some_and(|f| f != m) {
+                        return Err(());
+                    }
+                    found = Some(m);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = def_site.get(&v).ok_or(())?;
+        let inst = &p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32"
+            || w.abs != 0
+            || w.neg != 0
+            || w.opsel != 0
+            || w.sdwa.is_some()
+            || w.dpp.is_some()
+        {
+            return Err(());
+        }
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if const_lane(*at, p.wave64).ok_or(())? != lane {
+            return walk(
+                p,
+                st,
+                def_site,
+                phi_at,
+                inst.read(Reg::V(reg)).ok_or(())?,
+                lane,
+                seen,
+            );
+        }
+        let spill = match *value {
+            Operand::Scalar { code: NULL, .. } => Spill::Const(0),
+            Operand::Scalar { code, .. } => {
+                let sv = inst.read(Reg::S(code)).ok_or(())?;
+                if st.masks.contains_key(&sv) || st.highs.contains_key(&sv) {
+                    return Err(());
+                }
+                Spill::Value(sv)
+            }
+            Operand::Literal(x) => Spill::Const(x),
+            Operand::Const(c) => Spill::Const(crate::resource::inline(c).ok_or(())?),
+            _ => return Err(()),
+        };
+        Ok(Some(spill))
+    }
+
+    let mut resolved_reads = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.name() != "v_readlane_b32" {
+                continue;
+            }
+            let Fields::Valu(v) = &inst.fields else {
+                continue;
+            };
+            if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+                continue;
+            }
+            let [Operand::Vector { reg, .. }, lane_op] = v.src[..] else {
+                continue;
+            };
+            let (Some(lane), Some(vgpr_val)) =
+                (const_lane(lane_op, p.wave64), inst.read(Reg::V(reg)))
+            else {
+                continue;
+            };
+            if let Ok(Some(spill)) = walk(p, st, &def_site, &phi_at, vgpr_val, lane, &mut Vec::new())
+            {
+                let ok = match spill {
+                    Spill::Const(_) => true,
+                    Spill::Value(sv) => def_block.get(&sv).is_some_and(|&db| dominates(db, b)),
+                };
+                if ok {
+                    resolved_reads.insert((b, i), spill);
+                }
+            }
+        }
+    }
+
+    // Track which `v_writelane_b32` VGPR values never escape outside spill ops.
+    let mut candidates = HashSet::new();
+    let mut writelanes: Vec<(Site, Value, Option<Value>)> = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for phi in &block.phis {
+            if matches!(phi.reg, Reg::V(_)) {
+                candidates.insert(phi.value);
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.name() == "v_writelane_b32"
+                && let Fields::Valu(w) = &inst.fields
+                && let Some(Operand::Vector { reg, .. }) = w.dst
+                && let Some(written) = inst.write(Reg::V(reg))
+            {
+                candidates.insert(written);
+                writelanes.push(((b, i), written, inst.read(Reg::V(reg))));
+            }
+        }
+    }
+
+    let mut escaped = HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if resolved_reads.contains_key(&(b, i)) {
+                continue;
+            }
+            let in_place = if inst.name() == "v_writelane_b32"
+                && let Fields::Valu(w) = &inst.fields
+                && let Some(Operand::Vector { reg, .. }) = w.dst
+                && !w
+                    .src
+                    .iter()
+                    .any(|o| matches!(*o, Operand::Vector { reg: r, .. } if r == reg))
+            {
+                Some(Reg::V(reg))
+            } else {
+                None
+            };
+            for &(r, rv) in &inst.reads {
+                if Some(r) == in_place {
+                    continue;
+                }
+                if candidates.contains(&rv) {
+                    escaped.insert(rv);
+                }
+            }
+        }
+    }
+
+    loop {
+        let before = escaped.len();
+        for &(_, written, prev) in &writelanes {
+            if escaped.contains(&written)
+                && let Some(pv) = prev
+                && candidates.contains(&pv)
+            {
+                escaped.insert(pv);
+            }
+        }
+        for block in &p.blocks {
+            for phi in &block.phis {
+                if escaped.contains(&phi.value) {
+                    for &arg in &phi.args {
+                        if candidates.contains(&arg) {
+                            escaped.insert(arg);
+                        }
+                    }
+                }
+            }
+        }
+        if escaped.len() == before {
+            break;
+        }
+    }
+
+    let pure_spill_writes = writelanes
+        .into_iter()
+        .filter(|&(_, written, _)| !escaped.contains(&written))
+        .map(|(site, _, _)| site)
+        .collect();
+    (resolved_reads, pure_spill_writes)
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -936,6 +1192,7 @@ impl<'a> Lower<'a> {
                 Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
             ) && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let (resolved_reads, pure_spill_writes) = resolve_spills(p, x.st);
         let mut console_lanes = false;
         let mut wave64 = Wave64Mode::Native;
         let mut total_threads = 0u32;
@@ -954,16 +1211,26 @@ impl<'a> Lower<'a> {
         let mut cross_block_masks = HashMap::new();
         // Code reading other lanes needs the console's wave size and lane
         // order; so do lane masks read as numbers, and LDS shared within one
-        // wave, where the console compiler leaves out barriers.
+        // wave, where the console compiler leaves out barriers. SGPR spills
+        // resolved in SSA (`v_writelane_b32` -> `v_readlane_b32`) never read
+        // another lane's value, so they do not need the console's lanes.
         let uses_console_lanes = || {
-            insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
+            p.blocks.iter().enumerate().any(|(b, block)| {
+                block.insts.iter().enumerate().any(|(idx, i)| {
+                    let site = (b, idx);
+                    let n = i.name();
+                    if (n == "v_readlane_b32" && resolved_reads.contains_key(&site))
+                        || (n == "v_writelane_b32" && pure_spill_writes.contains(&site))
+                    {
+                        return false;
+                    }
+                    n.starts_with("ds_swizzle")
+                        || n.contains("permute")
+                        || n.starts_with("v_mbcnt")
+                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                        || reads_mask_as_data(x.st, i)
+                })
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -1068,13 +1335,20 @@ impl<'a> Lower<'a> {
             } else {
                 Wave64Mode::Native
             };
-
             match req_mode {
                 Wave64Mode::Native => {
                     let wave = if x.native.wave64 { 64 } else { 32 };
                     let one_wave = total_threads <= wave;
-                    if console_lanes || one_wave && title_lds_dwords > 0 {
-                        s.wave_size = Some(wave);
+                    if console_lanes || one_wave && title_lds_dwords > 0 && has_lds_mem {
+                        // Pick a host-supported wave size that still holds the
+                        // group when the console's wave size is unsupported (e.g.
+                        // a <=32-lane Wave64 group on a Wave32-only GPU),
+                        // falling back to the console's wave size when nothing
+                        // is reported or nothing fits.
+                        s.wave_size = Some(
+                            x.host_waves
+                                .map_or(wave, |range| range.choose(wave, total_threads)),
+                        );
                     }
                 }
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
@@ -1430,6 +1704,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            resolved_reads,
+            pure_spill_writes,
             spin: HashSet::new(),
             #[cfg(test)]
             spun: 0,
@@ -6599,6 +6875,13 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                if let Some(&spill) = self.resolved_reads.get(&(b, i)) {
+                    let r = match spill {
+                        Spill::Value(val) => self.i32_of(val)?,
+                        Spill::Const(k) => self.s.m.i32(k),
+                    };
+                    return int(self, r);
+                }
                 if let Some(&moved) = self.spills.get(&(b, i)) {
                     let r = match moved {
                         Moved::Const(k) => self.s.m.i32(k),
@@ -6630,6 +6913,10 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_writelane_b32" => {
+                if self.pure_spill_writes.contains(&(b, i)) {
+                    let zero = self.s.m.i32(0);
+                    return int(self, zero);
+                }
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -9671,6 +9958,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
+            host_waves: None,
         })
     }
 
@@ -9769,6 +10057,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
+            host_waves: None,
         })
     }
 
@@ -10046,6 +10335,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 options: super::TranslateOptions::default(),
+                host_waves: None,
             })
         };
 
@@ -10125,6 +10415,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
+            host_waves: None,
         })
         .unwrap();
 
@@ -10171,6 +10462,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
+            host_waves: None,
         })
         .unwrap();
     }
