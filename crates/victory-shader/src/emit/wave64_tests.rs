@@ -725,6 +725,7 @@ mod gpu {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
         };
         let root = host
             .root_signature_for(&[

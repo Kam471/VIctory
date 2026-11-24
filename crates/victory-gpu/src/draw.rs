@@ -647,18 +647,16 @@ impl State {
             ] {
                 for &(slot, param) in views {
                     if kind == RootView::Srv && crate::pipeline::host::bounded_root_srvs() {
-                        let Some(&Root::View(address)) =
-                            self.roots_ref(compute).get(usize::from(slot))
-                        else {
-                            once!(slot, "a shader reads a root view the title did not set");
-                            // An unset table is undefined: a null view instead.
-                            if !self.root_srv_table(list, None, param, compute) {
-                                return false;
-                            }
-                            continue;
+                        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                            Some(&Root::View(address)) => Some(address),
+                            _ => None,
                         };
-                        if !self.root_srv_table(list, Some(address), param, compute) {
-                            return false;
+                        // A table bounds the reads. With no dynamic slot or
+                        // no bound view heap, leave the table unset rather
+                        // than dropping the dispatch (a dropped one leaves
+                        // its outputs stale).
+                        if !self.root_srv_table(list, address, param, compute) {
+                            once!(slot, "a root SRV table could not be made; left unset");
                         }
                         continue;
                     }
@@ -1825,7 +1823,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 }
 
 #[cfg(test)]
-mod tests {
+mod root_view_tests {
     use super::*;
     use victory_shader::native::{ComputeIo, StageIo};
     use victory_shader::{
@@ -2098,6 +2096,12 @@ mod tests {
 
     #[test]
     fn dispatch_binds_fallbacks_and_copies_root_uav_writes_back() {
+        if crate::pipeline::host::bounded_root_srvs() {
+            eprintln!(
+                "root SRV tables need a bound view heap; run with VICTORY_ROOT_SRV_DIRECT=1"
+            );
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return;
         };

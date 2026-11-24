@@ -45,6 +45,17 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+/// Forgets every page the journal saw. Test isolation only: allocations
+/// are reused between tests, and a page number's old write would otherwise
+/// look like this test's.
+#[cfg(test)]
+pub(crate) fn forget() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked = 0;
+    j.written.clear();
+    j.found.clear();
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -330,6 +341,9 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        // Earlier tests may have used this page range; the journal would
+        // remember their writes after the allocator reuses the address.
+        forget();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(

@@ -57,6 +57,37 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
+/// SOPC `op src0, src1`.
+const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
+    0xBF00_0000 | (op as u32 & 0x7F) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// SOPP `op simm16`.
+const fn sopp(op: u8, simm16: i16) -> u32 {
+    0xBF80_0000 | (op as u32 & 0x7F) << 16 | simm16 as u16 as u32
+}
+
+/// VOP2 `op vdst, src0, vsrc1`.
+const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// VOP3B `op vdst, sdst, src0, src1, src2`.
+const fn vop3b(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x35 << 26 | (op as u32 & 0x3FF) << 16 | (sdst as u32 & 0x7F) << 8 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+/// GLOBAL `global_load_dword vdst, vaddr, saddr` (`saddr = 125` for null).
+const fn global_load_dword(vdst: u8, vaddr: u8, saddr: u8, offset: i16) -> [u32; 2] {
+    [
+        0x37 << 26 | 0x0C << 18 | 2 << 14 | (offset as u32 & 0xFFF),
+        (vdst as u32) << 24 | (saddr as u32 & 0x7F) << 16 | vaddr as u32,
+    ]
+}
+
 const fn sgpr(n: u8) -> u16 {
     n as u16
 }
@@ -1083,6 +1114,7 @@ fn build_root_srv_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1349,6 +1381,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
