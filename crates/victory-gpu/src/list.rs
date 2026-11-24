@@ -1196,6 +1196,16 @@ extern "system" fn execute_indirect(
         maybe_split(this);
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            if ran {
+                // Indirect records are the same work a direct call records:
+                // charge them so a mesh record cannot hide from the split.
+                let weight = match kind {
+                    10 => 64,
+                    2 => 2,
+                    _ => 1,
+                };
+                list.add_weight(weight.saturating_mul(max.max(1)));
+            }
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]

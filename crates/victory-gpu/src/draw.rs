@@ -659,7 +659,10 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
-                    list.add_weight(16);
+                    // A mesh dispatch is the expensive op: with a split budget
+                    // at or below this, each one gets its own submission, while
+                    // draws and compute dispatches batch up to the budget.
+                    list.add_weight(64);
                     true
                 }
                 Err(_) => false,
