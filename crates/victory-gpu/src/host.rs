@@ -1015,6 +1015,10 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // A title list reset starts a fresh list for the split budget too.
+        self.recorded.store(0, Ordering::Relaxed);
+        self.recorded_mesh.store(0, Ordering::Relaxed);
+        self.weight.store(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
