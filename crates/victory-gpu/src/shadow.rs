@@ -520,6 +520,14 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// Forgets the copies of memory outside buffer objects. Test isolation
+/// only: allocations are reused between tests, and a stale copy would
+/// otherwise shadow memory a later test reserved but did not map.
+#[cfg(test)]
+pub(crate) fn forget_loose() {
+    LOOSE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {

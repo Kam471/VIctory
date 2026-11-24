@@ -177,8 +177,10 @@ fn cached(
     (converter.translate)(container)
 }
 
-/// VSH2: root view registers are 16 bits (#614).
-const MAGIC: &[u8; 4] = b"VSH2";
+/// VSH3: root view registers are 16 bits (#614), root UAVs, and the
+/// runtime stride-table flag (#155). VSH2 named two incompatible layouts,
+/// so both are rejected.
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -261,6 +263,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     }
     word(&mut out, s.root_uavs.len() as u32);
     out.extend(&s.root_uavs);
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -324,6 +327,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.registers()?;
     let root_srvs = r.registers()?;
     let root_uavs = r.list()?;
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -333,6 +337,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        stride_table,
     })
 }
 
@@ -361,6 +366,7 @@ mod tests {
             // 0x305: an address in root constants 2 and 3 of parameter 5.
             root_srvs: vec![0, 3, 0x305],
             root_uavs: vec![1],
+            stride_table: true,
         }
     }
 
@@ -401,7 +407,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(
             cached(&cache, &build, Wave64Mode::Native, container, translate),
@@ -438,5 +444,12 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        // VSH2 named two incompatible layouts (16-bit registers, then the
+        // stride-table flag): neither may be read as this one.
+        assert_eq!(decode(b"VSH2"), None);
+
+        let mut plain = shader();
+        plain.stride_table = false;
+        assert_eq!(decode(&encode(&plain)), Some(plain));
     }
 }
