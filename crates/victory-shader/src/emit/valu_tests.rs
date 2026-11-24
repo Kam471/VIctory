@@ -180,6 +180,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -971,6 +972,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: slots.to_vec(),
+            stride_table: false,
         }
     };
 
@@ -1115,6 +1117,7 @@ fn build_root_srv_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1382,6 +1385,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
