@@ -52,8 +52,12 @@
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. 64-bit atomics
+//!   (added 2026-11-24) need an `R32G32_UINT` view there, as the title's,
+//!   and a device with 64-bit typed atomics on descriptor heap resources
+//!   (`AtomicInt64OnTypedResourceSupported`,
+//!   `AtomicInt64OnDescriptorHeapResourceSupported`); without them the host
+//!   refuses the pipeline. Global loads from a root SRV read it raw.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -79,9 +83,17 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lds_tests;
 mod lower;
+#[cfg(test)]
+mod opcode_audit;
+#[cfg(all(test, windows))]
+mod opcode_tests;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -91,13 +103,15 @@ mod valu_tests;
 mod wave;
 #[cfg(test)]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod wave_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -119,6 +133,21 @@ pub fn loop_limit() -> u32 {
         } else {
             lower::LOOP_LIMIT
         }
+    })
+}
+
+/// With the `diagnostics` feature, `VICTORY_WAVE32_FORCE=1` makes every
+/// compute program that would ask for a 64-lane wave ask for 32 instead.
+///
+/// This is the experiment from issue #71: a Wave32-only GPU (NVIDIA) then
+/// creates pipelines that were refused, but a program that really uses
+/// 64-lane ballots or lane numbers computes with 32-lane semantics. Part of
+/// the translation, so the shader cache keys on it.
+pub fn wave32_force() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_WAVE32_FORCE").is_ok_and(|v| v.trim() == "1")
     })
 }
 
@@ -156,6 +185,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// True when the shader reads the runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`]).
+    pub stride_table: bool,
 }
 
 impl HostShader {
@@ -270,11 +302,17 @@ pub fn emit_with(
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // read get the mode their barycentrics say. Conservative depth outputs
+    // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`) require centroid or sample
+    // interpolation on `SV_Position`.
+    let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
+    let psv_modes = c
+        .part(FourCC::PSV0)
+        .and_then(|p| psv_interp(p.data, pixel));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
+            (3, _) => if conservative_depth { 5 } else { 4 },
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
@@ -282,6 +320,17 @@ pub fn emit_with(
             (0, _) => 1,
             _ => 0,
         };
+        if let Some(modes) = &psv_modes
+            && let Some(&(_, _, _, m)) = modes
+                .iter()
+                .find(|&&(row, col, kind, m)| row == e.row && col == e.col && kind == e.kind && m != 0)
+        {
+            e.interp = if e.kind == 3 && conservative_depth && m == 4 {
+                5
+            } else {
+                m
+            };
+        }
     }
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
@@ -339,7 +388,51 @@ pub fn emit_with(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        stride_table: l.stride_table,
     })
+}
+
+/// Interpolation modes of the input (for pixel) or output (for vertex/mesh)
+/// signature elements carried in a container's `PSV0` part: `(row, col, kind,
+/// interp)`.
+fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<(Option<u32>, u8, u8, u8)>> {
+    use crate::dxbc::u32_at;
+    let info_sz = u32_at(part, 0).ok()? as usize;
+    if info_sz < 32 {
+        return None;
+    }
+    let info = part.get(4..4 + info_sz)?;
+    let (n_in, n_out, n_prim) = (info[28] as usize, info[29] as usize, info[30] as usize);
+    let mut pos = 4 + info_sz;
+    let n_bind = u32_at(part, pos).ok()? as usize;
+    pos += 4;
+    if n_bind > 0 {
+        let bsz = u32_at(part, pos).ok()? as usize;
+        pos = pos.checked_add(4)?.checked_add(n_bind.checked_mul(bsz)?)?;
+    }
+    let str_sz = u32_at(part, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(str_sz)?;
+    let idx_cnt = u32_at(part, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(idx_cnt.checked_mul(4)?)?;
+    if n_in + n_out + n_prim == 0 {
+        return Some(Vec::new());
+    }
+    let esz = u32_at(part, pos).ok()? as usize;
+    pos += 4;
+    if esz < 14 {
+        return None;
+    }
+    let (start_i, count) = if pixel { (0, n_in) } else { (n_in, n_out) };
+    let mut out = Vec::with_capacity(count);
+    for i in start_i..start_i + count {
+        let off = pos.checked_add(i.checked_mul(esz)?)?;
+        let e = part.get(off..off + esz)?;
+        let alloc = e[10] & 0x40 != 0;
+        let row = alloc.then_some(u32::from(e[9]));
+        let col = if alloc { (e[10] >> 4) & 3 } else { 0 };
+        out.push((row, col, e[11], e[13]));
+    }
+    Some(out)
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -389,6 +482,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -533,6 +627,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            stride_table: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -543,6 +638,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                stride_table: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -636,5 +732,257 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// A compute program with one image atomic on a texture from a
+    /// descriptor table in s0, as emitted DXIL.
+    fn image_atomic(atomic: [u32; 2], data: &[u32]) -> Result<HostShader, ShaderError> {
+        let mut words = vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+        ];
+        words.extend(data);
+        words.extend(atomic);
+        words.push(0xBF81_0000); // s_endpgm
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            // One user SGPR, thread ids in v0 and v1.
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1 | 1 << 11,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        let container = crate::dxbc::build(&[]);
+        emit(&Container::parse(&container)?, &native, &p, &st, &io, &res)
+    }
+
+    /// The `SFI0` feature bits of an emitted container.
+    fn features(dxil: &[u8]) -> u64 {
+        let c = Container::parse(dxil).unwrap();
+        let part = c.part(FourCC::SFI0).unwrap();
+        u64::from_le_bytes(part.data[..8].try_into().unwrap())
+    }
+
+    /// 64-bit image atomics (dmask 0x3, cmpswap 0xF: two dwords per value)
+    /// translate to DXIL's i64 atomics, and the shader requires 64-bit
+    /// atomics on typed and on heap resources (the bits DXC sets for
+    /// `InterlockedMax` on a `RWTexture2D<uint64_t>` from
+    /// `ResourceDescriptorHeap`).
+    #[test]
+    fn a_64_bit_image_atomic_requires_64_bit_typed_atomics() {
+        const INT64: u64 = 0x8000;
+        const TYPED: u64 = 0x40_0000;
+        const HEAP: u64 = 0x1000_0000;
+        let narrow = image_atomic(
+            // image_atomic_umax v2, v[0:1], s[4:11] dmask:0x1 dim:2D unorm glc
+            [0xF05C_3108, 0x0001_0200],
+            &[0x7E04_0300], // v_mov_b32 v2, v0
+        )
+        .unwrap();
+        assert_eq!(features(&narrow.dxil) & (TYPED | HEAP), 0);
+        let umax = image_atomic(
+            // image_atomic_umax v[2:3], v[0:1], s[4:11] dmask:0x3 dim:2D unorm glc
+            [0xF05C_3308, 0x0001_0200],
+            &[
+                0x7E04_0300, // v_mov_b32 v2, v0
+                0x7E06_0280, // v_mov_b32 v3, 0
+            ],
+        )
+        .unwrap();
+        let cmpswap = image_atomic(
+            // image_atomic_cmpswap v[2:5], v[0:1], s[4:11] dmask:0xf dim:2D unorm glc
+            [0xF040_3F08, 0x0001_0200],
+            &[
+                0x7E04_0300, // v_mov_b32 v2, v0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7E08_0301, // v_mov_b32 v4, v1
+                0x7E0A_02C1, // v_mov_b32 v5, -1
+            ],
+        )
+        .unwrap();
+        for wide in [umax, cmpswap] {
+            assert_eq!(
+                features(&wide.dxil) & (INT64 | TYPED | HEAP),
+                INT64 | TYPED | HEAP
+            );
+        }
+    }
+
+    /// An image atomic on some channels of a pair has no DXIL form.
+    #[test]
+    fn an_image_atomic_on_part_of_a_pair_is_refused() {
+        let err = image_atomic(
+            // image_atomic_umax v[2:3], v[0:1], s[4:11] dmask:0x5 dim:2D unorm glc
+            [0xF05C_3508, 0x0001_0200],
+            &[0x7E04_0300, 0x7E06_0280],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("an image atomic of some channels"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn structured_buffer_unknown_stride_uses_runtime_stride_table() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E06_028A, // v_mov_b32 v3, 10
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            options: Default::default(),
+        })
+        .unwrap();
+        assert!(l.stride_table);
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                stride_table: l.stride_table,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let srv_data: Vec<u32> = (100..112).collect();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![
+                            (0, super::host::Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (
+                                1,
+                                super::host::Root::View {
+                                    srv: true,
+                                    data: vec![12, 12],
+                                },
+                            ),
+                        ],
+                        views: &[
+                            super::host::View::Buffer {
+                                data: &srv_data,
+                                stride: super::host::Stride::Raw,
+                            },
+                            super::host::View::RawUav(64),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0][5], 107);
+            assert_eq!(out[0][6], 20);
+        }
     }
 }

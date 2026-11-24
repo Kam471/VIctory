@@ -148,6 +148,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -673,4 +674,160 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+}
+
+/// SCC after the SOP2 `op s12, s0, s1`, read back into `v0` through
+/// `s_cselect_b32 s13, 1, 0`.
+fn scc_after(op: u8) -> HostShader {
+    build_valu_cs(&[
+        sop2(op, 12, 0, 1),
+        sop2(0x0A, 13, 129, 128), // s_cselect_b32 s13, 1, 0
+        vop1(0x001, 0, sgpr(13)), // v_mov_b32 v0, s13
+    ])
+}
+
+/// Checks the SCC that `op` leaves for each `(s0, s1, scc)`.
+fn check_scc(name: &str, op: u8, cases: &[(u32, u32, u32)]) {
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&scc_after(op), &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: SCC after {name}({:#010x}, {:#010x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn s_min_and_s_max_set_scc_when_src0_is_chosen() {
+    let m1 = (-1i32) as u32;
+    check_scc("s_min_i32", 0x06, &[(m1, 2, 1), (2, m1, 0), (4, 4, 0)]);
+    check_scc("s_min_u32", 0x07, &[(3, 5, 1), (5, 3, 0), (4, 4, 0)]);
+    check_scc("s_max_i32", 0x08, &[(2, m1, 1), (m1, 2, 0), (4, 4, 0)]);
+    check_scc("s_max_u32", 0x09, &[(5, 3, 1), (3, 5, 0), (4, 4, 0)]);
+}
+
+#[test]
+fn s_lshl_add_sets_scc_on_unsigned_overflow() {
+    // (s0 << n) + s1 past 32 bits, through the shift or through the add.
+    check_scc(
+        "s_lshl1_add_u32",
+        0x2E,
+        &[
+            (1, 2, 0),
+            (1, 0xFFFF_FFFD, 0),
+            (1, 0xFFFF_FFFE, 1),
+            (0x8000_0000, 0, 1),
+        ],
+    );
+    check_scc(
+        "s_lshl4_add_u32",
+        0x31,
+        &[
+            (0x0FFF_FFFF, 0xF, 0),
+            (0x0FFF_FFFF, 0x10, 1),
+            (0x1000_0000, 0, 1),
+        ],
+    );
+}
+
+/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
+const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
+        0x80 << 24
+            | (op as u32 >> 3 & 1) << 21
+            | (srsrc as u32 >> 2 & 0x1F) << 16
+            | (vdata as u32) << 8,
+    ]
+}
+
+/// Stores `v1` to the buffer, then reads it back into `v0` with the tbuffer
+/// load `op` in buffer format `format`.
+fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
+    let mut body = buffer_store_dword(1, 8, 0).to_vec();
+    body.extend(mtbuf(op, 0, 8, format));
+    build_valu_cs(&body)
+}
+
+#[test]
+fn tbuffer_d16_loads_pack_two_channels_per_dword() {
+    // tbuffer_load_format_d16_x and tbuffer_load_format_d16_xy.
+    let (x, xy) = (8, 9);
+    // (opcode, format, dword stored, dword loaded)
+    let cases: &[(u8, u8, u32, u32)] = &[
+        // 16_16_FLOAT: the f16 pair (1.0, 2.0) as it was stored.
+        (xy, 29, 0x4000_3C00, 0x4000_3C00),
+        // 16_16_UINT: the 16-bit integers as they were stored.
+        (xy, 27, 0xBEEF_1234, 0xBEEF_1234),
+        // 16_16_UNORM: 0.0 and 1.0, as f16.
+        (xy, 23, 0xFFFF_0000, 0x3C00_0000),
+        // 16_FLOAT, one channel: the high half is 0.
+        (x, 13, 0x4000_3C00, 0x0000_3C00),
+    ];
+    for &(op, format, stored, want) in cases {
+        let shader = tbuffer_load_of_v1(op, format);
+        run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: d16 opcode {op} format {format} of {stored:#010x} = {got:#010x}, want {want:#010x}",
+            );
+        });
+    }
+}
+
+#[test]
+fn v_cmp_f32_nan_matches_rdna2() {
+    let nan = f32::NAN.to_bits();
+    let one = 1.0f32.to_bits();
+    let two = 2.0f32.to_bits();
+    let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+
+    // Self-comparisons (x, x): ordered predicates must be false on NaN and true
+    // on finite values; unordered predicates must be true on NaN and false on
+    // finite values (Intel Xe folds plain `fcmp` self-compares to constants).
+    for (name, opc, want_nan, want_one) in [
+        ("v_cmp_eq_f32", 0x002u16, 0u32, 1u32),
+        ("v_cmp_le_f32", 0x003u16, 0u32, 1u32),
+        ("v_cmp_ge_f32", 0x006u16, 0u32, 1u32),
+        ("v_cmp_o_f32", 0x007u16, 0u32, 1u32),
+        ("v_cmp_u_f32", 0x008u16, 1u32, 0u32),
+        ("v_cmp_nge_f32", 0x009u16, 1u32, 0u32),
+        ("v_cmp_nle_f32", 0x00cu16, 1u32, 0u32),
+        ("v_cmp_neq_f32", 0x00du16, 1u32, 0u32),
+    ] {
+        let cmp = vop3(opc, 6, vgpr(1), vgpr(1), 0);
+        let sh = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
+        run_cases(&sh, &[[nan, 0, 0, 0], [one, 0, 0, 0]], |backend, i, _, got| {
+            let want = if i == 0 { want_nan } else { want_one };
+            assert_eq!(
+                got, want,
+                "{backend}: {name}(same reg, case {i}) = {got}, want {want}",
+            );
+        });
+    }
+
+    // Distinct-register ordered/unordered comparisons: Intel Xe also folds
+    // `fcmp ord`/`fcmp uno` on distinct registers when either operand is NaN.
+    for (name, opc, want_nan, want_finite) in [
+        ("v_cmp_o_f32", 0x007u16, 0u32, 1u32),
+        ("v_cmp_u_f32", 0x008u16, 1u32, 0u32),
+    ] {
+        let cmp = vop3(opc, 6, vgpr(1), vgpr(2), 0);
+        let sh = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
+        let inputs = [
+            [nan, one, 0, 0],
+            [one, nan, 0, 0],
+            [nan, nan, 0, 0],
+            [one, two, 0, 0],
+        ];
+        run_cases(&sh, &inputs, |backend, i, _, got| {
+            let want = if i == 3 { want_finite } else { want_nan };
+            assert_eq!(
+                got, want,
+                "{backend}: {name}(diff reg, case {i}) = {got}, want {want}",
+            );
+        });
+    }
 }

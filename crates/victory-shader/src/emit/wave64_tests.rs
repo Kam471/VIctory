@@ -870,7 +870,9 @@ mod gpu {
             [1, 1, 1],
             32,
             &expected,
-            true,
+            // Constant-lane spills resolve in SSA now, so no lane operation
+            // remains and the native path may build the program.
+            false,
         );
     }
 

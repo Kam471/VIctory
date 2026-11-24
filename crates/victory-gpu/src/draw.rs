@@ -170,6 +170,12 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Takes the dynamic descriptor slots held by this recording, so a
+    /// pending host list can keep them alive until its submission finishes.
+    pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
+        std::mem::take(&mut self.dynamic)
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -341,7 +347,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         self.bind(list, p, false);
@@ -486,6 +495,24 @@ impl State {
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
+                }
+            }
+            if let Some(param) = stage.stride_table {
+                let gpu = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .and_then(|h| h.stride_table_gpu());
+                if let Some(gpu) = gpu {
+                    // SAFETY: an open list; the stride table buffer lives with the host heap.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootShaderResourceView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootShaderResourceView(param, gpu);
+                        }
+                    }
+                } else {
+                    once!("a shader reads the runtime stride table without a host view heap");
                 }
             }
         }
@@ -951,15 +978,24 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let len = u64::from(stride) * u64::from(max.max(1));
+        if max == 0 {
+            return true;
+        }
+        let Some(len) = crate::indirect::byte_len(kind, stride, max) else {
+            why("record span");
+            return false;
+        };
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
         };
+        if !args.offset(arguments).is_multiple_of(4) {
+            return false;
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
-                Some(s) => Some((s, at)),
-                None => {
+                Some(s) if s.offset(at).is_multiple_of(4) => Some((s, at)),
+                _ => {
                     why("count outside title buffers");
                     return false;
                 }
@@ -977,8 +1013,18 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let separate_counter = counter
+            .as_ref()
+            .map(|(s, _)| &s.buffer)
+            .filter(|&buffer| buffer != &args.buffer);
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            separate_counter,
+            (kind, stride, max),
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -997,17 +1043,23 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, separate_counter);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
@@ -1021,7 +1073,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, separate_counter);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1124,7 +1176,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {

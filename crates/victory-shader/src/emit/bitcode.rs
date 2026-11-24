@@ -39,6 +39,7 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
+    align: u64,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
 }
@@ -73,7 +74,6 @@ pub(crate) enum Bin {
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
-    Sub = 2,
     And = 3,
     Or = 5,
     Xor = 6,
@@ -96,6 +96,7 @@ pub(crate) enum Cast {
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
+#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
@@ -218,6 +219,46 @@ impl Module {
         Ty(t)
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_of(&self, target: V) -> usize {
+        let mut n = 0;
+        let mut count = |v: V| {
+            if v == target {
+                n += 1;
+            }
+        };
+        for inst in &self.insts {
+            match &inst.op {
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) => {
+                    count(*a);
+                    count(*b);
+                }
+                Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => count(*a),
+                Op::AtomicRmw(_, c, t) => {
+                    count(*c);
+                    count(*t);
+                }
+                Op::Select(c, t, f) | Op::CmpXchg(c, t, f) => {
+                    count(*c);
+                    count(*t);
+                    count(*f);
+                }
+                Op::Call(_, args) => args.iter().for_each(|&v| count(v)),
+                Op::Phi(incoming) => incoming.iter().for_each(|&(v, _)| count(v)),
+                Op::Gep(_, base, idx) => {
+                    count(*base);
+                    idx.iter().for_each(|&v| count(v));
+                }
+            }
+        }
+        for block in &self.blocks {
+            if let Some(Term::CondBr(cond, _, _)) = block.term {
+                count(cond);
+            }
+        }
+        n
+    }
+
     pub fn void(&mut self) -> Ty {
         self.ty(TypeDef::Void)
     }
@@ -323,9 +364,15 @@ impl Module {
             ty,
             ptr,
             space,
+            align: 3,
             init: None,
         });
         V::Global(self.globals.len() as u32 - 1)
+    }
+
+    pub fn align_global_to_eight(&mut self, global: V) {
+        let V::Global(n) = global else { unreachable!() };
+        self.globals[n as usize].align = 4; // log2(alignment) + 1
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -552,7 +599,7 @@ impl Module {
                     u64::from(g.space) << 2 | 2 | constant,
                     init,
                     linkage,
-                    3,
+                    g.align,
                     0,
                 ],
             );
