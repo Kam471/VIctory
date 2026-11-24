@@ -200,6 +200,25 @@ impl Shadow {
         *before = Some((start, grown));
     }
 
+    /// The runs `(first, last + 1)` of copy-back pages to ask about: the
+    /// pages `synced` inside `[first, last)`, coalesced. Pages the GPU did
+    /// not write keep their write-watch bits for the next refresh.
+    fn copy_back_runs(synced: &[usize], first: usize, last: usize) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &page in synced {
+            if !(first..last).contains(&page) {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((_, end)) if *end == page => *end += 1,
+                Some((_, end)) if *end < page => runs.push((page, page + 1)),
+                Some(_) => {}
+                None => runs.push((page, page + 1)),
+            }
+        }
+        runs
+    }
+
     /// After the submission ran: copies the bytes its shaders wrote back
     /// into title memory (unmapped pages left alone), and only those: the
     /// title's threads write the same buffers while the GPU runs (its
@@ -254,16 +273,33 @@ impl Shadow {
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
+            // Ask only over the pages this copy back actually synced: a
+            // declared view can span hundreds of MB while the GPU changed a
+            // few 64 KiB pieces, and asking the kernel about the whole view
+            // scanned every page of it on every submission.
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if first < last
                 && !synced.is_empty()
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
             {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+                synced.sort_unstable();
+                synced.dedup();
+                let mut asks = Vec::new();
+                for (from_page, to_page) in Self::copy_back_runs(&synced, first, last) {
+                    if let Some((now, _)) =
+                        crate::watch::writes(from_page * PAGE, to_page * PAGE, true)
+                    {
+                        asks.push((from_page, to_page, now));
+                    }
+                }
+                if !asks.is_empty() {
+                    let base = start / PAGE;
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    for (from_page, to_page, now) in asks {
+                        for page in from_page..to_page {
+                            copied[page - base] = now;
+                        }
+                    }
                 }
             }
         }
@@ -624,6 +660,29 @@ mod tests {
         let (runs, fresh) = Shadow::stale_runs(&never, base, range.0, range.1, &write, bounds);
         assert_eq!(runs, [(202, 206)]);
         assert_eq!(fresh, [202, 203, 204, 205]);
+    }
+
+    #[test]
+    fn copy_back_watches_only_the_pages_the_gpu_changed() {
+        // A 100-page declared range with five changed pages: the kernel is
+        // asked about those, not the other 95 pages (a 174 MB view scans
+        // only the few pages the shaders wrote).
+        let synced = [101, 102, 103, 150, 199];
+        assert_eq!(
+            Shadow::copy_back_runs(&synced, 100, 200),
+            [(101, 104), (150, 151), (199, 200)]
+        );
+        // Nothing changed: no watch at all.
+        assert!(Shadow::copy_back_runs(&[], 100, 200).is_empty());
+        // Partly covered boundary pages are left out, as before.
+        let synced = [99, 100, 101, 199, 200];
+        assert_eq!(
+            Shadow::copy_back_runs(&synced, 100, 200),
+            [(100, 102), (199, 200)]
+        );
+        // Duplicate pages from overlapping syncs do not add runs.
+        let synced = [100, 100, 101, 101];
+        assert_eq!(Shadow::copy_back_runs(&synced, 100, 200), [(100, 102)]);
     }
 
     #[test]
