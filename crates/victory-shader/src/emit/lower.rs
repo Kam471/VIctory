@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
+    /// `PSV0`: what the console declared about the registers the program
+    /// binds (structured-buffer declarations, for record counts).
+    pub psv: Option<&'a [u8]>,
     pub p: &'a Program,
     pub st: &'a Structured,
     pub io: &'a Io,
@@ -4895,7 +4898,28 @@ impl<'a> Lower<'a> {
             }
             let uav = used.kind == ResourceType::Uav;
             let u = if uav { 0x1000 } else { 0 };
-            let (props, image) = if used.dwords == 4 {
+            // The program may only inspect NUM_RECORDS, leaving no resource
+            // use to say what the descriptor is. Recover it only from an
+            // exact, statically addressed four-dword table binding whose
+            // PSV0 declaration says structured; never from the nearest
+            // earlier entry or a dynamically indexed range.
+            let address = self.scalar.get(&site).copied();
+            let exact = address.is_some_and(|a| {
+                a.dynamic.is_none()
+                    && used.table_offset_dwords.checked_mul(4) == Some(a.offset)
+            });
+            let structured = exact
+                && count == 4
+                && used.dwords == 4
+                && matches!(used.kind, ResourceType::Srv | ResourceType::Uav)
+                && (4..=2048).contains(&used.stride)
+                && used.stride.is_multiple_of(4)
+                && self.x.psv.is_some_and(|part| {
+                    super::declares_structured_buffer(part, used.lower_bound, uav)
+                });
+            let (props, image) = if structured {
+                ((12 | u, used.stride), None)
+            } else if used.dwords == 4 {
                 let stride = used.stride;
                 let props = if stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
@@ -9778,6 +9802,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
             native: &native,
+            psv: None,
             p: &p,
             st: &st,
             io: &io,
@@ -9876,6 +9901,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
             native: &native,
+            psv: None,
             p: &p,
             st: &st,
             io: &io,
@@ -10154,6 +10180,7 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             lower(&Parts {
                 native: &native,
+                psv: None,
                 p: &p,
                 st: &st,
                 io: &io,
@@ -10233,6 +10260,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
             native: &native,
+            psv: None,
             p: &p,
             st: &st,
             io: &io,
@@ -10279,6 +10307,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
             native: &native_cs,
+            psv: None,
             p: &p,
             st: &st,
             io: &io,
