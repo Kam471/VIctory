@@ -27,6 +27,19 @@ there as they are. Since step 1 they stop at translation with the reason
 (`emit::Target`) instead of being refused at pipeline creation.
 `victory translate --host-lanes 32-32` counts them.
 
+## This branch's lowering modes
+
+`TranslateOptions.wave64` selects `Native`, `Wave32` or `Emulate`, and the
+host's wave range arrives separately as `Target`. A `Wave32` translation
+for a host with 32-lane but not 64-lane waves tries the split and console
+flow above first. What that cannot lower (LDS, several console waves per
+group, whole-wave sections, `ds_(b)permute`) keeps the branch's earlier
+virtual-wave emulation. `Emulate` never uses the console flow. Mesh
+programs have no `WaveSize`, so they only use the branch's virtual-wave
+emulation; a cross-lane read only some lanes reach still stops, `v_readfirstlane`
+in divergent flow included. `Target::ANY` and `Native` on a host that runs
+64-lane waves keep the per-lane form.
+
 ## The form
 
 One console wave of 64 runs as two host waves of 32 lanes ("halves") of the

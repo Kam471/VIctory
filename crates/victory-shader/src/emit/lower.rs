@@ -17,7 +17,9 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Moved, RelOffset, Resources, Role, Site, Source, spilled_sgprs};
+use crate::resource::{
+    Address, CODE, Moved, RelOffset, Resources, Role, Site, Source, spilled_sgprs,
+};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
@@ -1000,89 +1002,86 @@ impl<'a> Lower<'a> {
         let reads_whole = insts().any(whole);
         let masks_held = {
             // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let selects = insts().filter_map(|i| {
-                    let Fields::Valu(v) = &i.fields else {
-                        return None;
-                    };
-                    if !matches!(
+            // tests its own bit by its console lane.
+            let whens = x.st.exits.iter().filter_map(|e| match *e {
+                LaneExit::Branch { when, .. } => Some(when),
+                _ => None,
+            });
+            let selects = insts().filter_map(|i| {
+                let Fields::Valu(v) = &i.fields else {
+                    return None;
+                };
+                if !matches!(
+                    i.name(),
+                    "v_cndmask_b32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
+                ) {
+                    return None;
+                }
+                let &Operand::Scalar { code, .. } = v.src.get(2)? else {
+                    return None;
+                };
+                if code == NULL {
+                    return None;
+                }
+                let m = i.read(Reg::S(code))?;
+                x.st.masks.get(&m).copied()
+            });
+            let mut seen_bools = HashSet::new();
+            let mut seen_phis = HashSet::new();
+            let mut work: Vec<Bool> =
+                x.st.guards
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .copied()
+                    .chain(whens)
+                    .chain(selects)
+                    .collect();
+            let mut needs_console = false;
+            while let Some(g) = work.pop() {
+                if !seen_bools.insert(g) {
+                    continue;
+                }
+                for a in x.st.bools.support(g) {
+                    match a {
+                        Atom::Opaque(_) | Atom::Constant(_) => {
+                            needs_console = true;
+                            break;
+                        }
+                        Atom::Phi(id) if seen_phis.insert(id) => {
+                            if let Some(edges) = x.st.phi_masks.get(&id) {
+                                work.extend(edges.iter().copied());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if needs_console {
+                    break;
+                }
+            }
+            needs_console
+                || insts().any(|i| {
+                    matches!(
                         i.name(),
                         "v_cndmask_b32"
                             | "v_add_co_ci_u32"
                             | "v_sub_co_ci_u32"
                             | "v_subrev_co_ci_u32"
-                    ) {
-                        return None;
-                    }
-                    let &Operand::Scalar { code, .. } = v.src.get(2)? else {
-                        return None;
-                    };
-                    if code == NULL {
-                        return None;
-                    }
-                    let m = i.read(Reg::S(code))?;
-                    x.st.masks.get(&m).copied()
-                });
-                let mut seen_bools = HashSet::new();
-                let mut seen_phis = HashSet::new();
-                let mut work: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .chain(selects)
-                        .collect();
-                let mut needs_console = false;
-                while let Some(g) = work.pop() {
-                    if !seen_bools.insert(g) {
-                        continue;
-                    }
-                    for a in x.st.bools.support(g) {
-                        match a {
-                            Atom::Opaque(_) | Atom::Constant(_) => {
-                                needs_console = true;
-                                break;
-                            }
-                            Atom::Phi(id) if seen_phis.insert(id) => {
-                                if let Some(edges) = x.st.phi_masks.get(&id) {
-                                    work.extend(edges.iter().copied());
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if needs_console {
-                        break;
-                    }
-                }
-                needs_console
-                    || insts().any(|i| {
-                        matches!(
-                            i.name(),
-                            "v_cndmask_b32"
-                                | "v_add_co_ci_u32"
-                                | "v_sub_co_ci_u32"
-                                | "v_subrev_co_ci_u32"
-                        ) && match &i.fields {
-                            Fields::Valu(v) => match v.src.get(2) {
-                                Some(&Operand::Scalar { code, .. }) => i
-                                    .read(Reg::S(code))
-                                    .is_none_or(|m| !x.st.masks.contains_key(&m)),
-                                _ => false,
-                            },
+                    ) && match &i.fields {
+                        Fields::Valu(v) => match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) => i
+                                .read(Reg::S(code))
+                                .is_none_or(|m| !x.st.masks.contains_key(&m)),
                             _ => false,
-                        }
-                    })
+                        },
+                        _ => false,
+                    }
+                })
         };
         let uses_console_lanes = || reads_whole || masks_held || insts().any(in_half);
-        let has_lds_mem = insts()
-            .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
+        let has_lds_mem =
+            insts().any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
         let has_s_barrier = insts().any(|i| i.name() == "s_barrier");
         let has_swizzle_or_dpp = insts().any(|i| {
             i.name().starts_with("ds_swizzle")
@@ -1112,8 +1111,7 @@ impl<'a> Lower<'a> {
             // (`v_readfirstlane` reads the console wave's first lane, which
             // the upper half does not hold: such programs take the console
             // flow below.)
-            let paired_host =
-                x.native.wave64 && !x.target.runs(64) && x.target.runs(32);
+            let paired_host = x.native.wave64 && !x.target.runs(64) && x.target.runs(32);
             let pr_split = paired_host
                 && console_lanes
                 && !reads_whole
@@ -1150,12 +1148,12 @@ impl<'a> Lower<'a> {
                     wants_console_flow |= x.target.runs(wave)
                         && insts()
                             .any(|i| matches!(i.name(), "v_readlane_b32" | "v_writelane_b32"))
-                        && x.st.exits.iter().any(
-                            |e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)),
-                        )
+                        && x.st
+                            .exits
+                            .iter()
+                            .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
                         && !insts().any(|i| i.name().contains("permute"))
-                        && (0..p.blocks.len())
-                            .all(|b| super::wave::sections(p, b).is_empty());
+                        && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
                     if x.console_cf {
                         console_lanes = true;
                         // In halves only where the host cannot run the
@@ -1174,6 +1172,7 @@ impl<'a> Lower<'a> {
                     // handle first what it covers (in-half halves and groups
                     // of one console wave).
                     if req_mode == Wave64Mode::Wave32
+                        && !x.per_lane_only
                         && (x.console_cf || pr_split || pr_console)
                     {
                         wave64 = Wave64Mode::Native;
@@ -1189,9 +1188,9 @@ impl<'a> Lower<'a> {
                             s.wave_size = Some(if x.native.wave64 { 64 } else { 32 });
                         }
                     } else {
-                    spills = spilled_sgprs(p);
-                    (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
-                    let has_non_uniform_firstlane = insts().any(|i| {
+                        spills = spilled_sgprs(p);
+                        (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                        let has_non_uniform_firstlane = insts().any(|i| {
                         i.name() == "v_readfirstlane_b32"
                             && matches!(
                                 &i.fields,
@@ -1200,29 +1199,57 @@ impl<'a> Lower<'a> {
                                         if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
                             )
                     });
-                    let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
-                        blk.insts.iter().enumerate().any(|(i, inst)| {
-                            inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
-                        })
-                    });
-                    let need_emu =
-                        console_lanes || !sections.is_empty() || has_non_uniform_firstlane;
+                        let has_unresolved_readlane =
+                            p.blocks.iter().enumerate().any(|(b, blk)| {
+                                blk.insts.iter().enumerate().any(|(i, inst)| {
+                                    inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
+                                })
+                            });
+                        let need_emu =
+                            console_lanes || !sections.is_empty() || has_non_uniform_firstlane;
 
-                    if req_mode == Wave64Mode::Wave32 {
-                        if total_threads <= 32 {
-                            // Fits inside one native 32-lane wave.
-                            wave64 = Wave64Mode::Wave32;
-                            if need_emu || has_lds_mem {
-                                s.wave_size = Some(32);
+                        if req_mode == Wave64Mode::Wave32 {
+                            if total_threads <= 32 {
+                                // Fits inside one native 32-lane wave.
+                                wave64 = Wave64Mode::Wave32;
+                                if need_emu || has_lds_mem {
+                                    s.wave_size = Some(32);
+                                }
+                            } else {
+                                if need_emu {
+                                    wave64 = Wave64Mode::Wave32;
+                                    s.wave_size = Some(32);
+                                    virtual_waves = total_threads.div_ceil(64);
+                                    ballot_stride = if has_non_uniform_firstlane { 4 } else { 2 };
+                                    let ballot_dwords = ballot_stride * virtual_waves;
+                                    let exchange_dwords = if has_unresolved_readlane {
+                                        64 * virtual_waves
+                                    } else {
+                                        0
+                                    };
+                                    ballot_base = title_lds_dwords;
+                                    exchange_base = title_lds_dwords + ballot_dwords;
+                                    let emu_dwords = ballot_dwords + exchange_dwords;
+                                    s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
+                                    lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
+                                    cross_block_masks =
+                                        collect_cross_block_masks(p, x.st, &def_block);
+                                }
+                                if total_threads <= 64 && has_lds_mem && !has_s_barrier {
+                                    need_lds_barriers = true;
+                                }
                             }
                         } else {
+                            // Wave64Mode::Emulate (`s.wave_size = None`).
                             if need_emu {
-                                wave64 = Wave64Mode::Wave32;
-                                s.wave_size = Some(32);
+                                wave64 = Wave64Mode::Emulate;
                                 virtual_waves = total_threads.div_ceil(64);
-                                ballot_stride = if has_non_uniform_firstlane { 4 } else { 2 };
-                                let ballot_dwords = ballot_stride * virtual_waves;
-                                let exchange_dwords = if has_unresolved_readlane {
+                                ballot_stride = 2;
+                                let ballot_dwords = 2 * virtual_waves;
+                                let exchange_dwords = if !sections.is_empty()
+                                    || has_unresolved_readlane
+                                    || has_swizzle_or_dpp
+                                {
                                     64 * virtual_waves
                                 } else {
                                     0
@@ -1234,40 +1261,17 @@ impl<'a> Lower<'a> {
                                 lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
                                 cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
                             }
-                            if total_threads <= 64 && has_lds_mem && !has_s_barrier {
+                            if total_threads > 1
+                                && total_threads <= 64
+                                && has_lds_mem
+                                && !has_s_barrier
+                            {
                                 need_lds_barriers = true;
                             }
-                        }
-                    } else {
-                        // Wave64Mode::Emulate (`s.wave_size = None`).
-                        if need_emu {
-                            wave64 = Wave64Mode::Emulate;
-                            virtual_waves = total_threads.div_ceil(64);
-                            ballot_stride = 2;
-                            let ballot_dwords = 2 * virtual_waves;
-                            let exchange_dwords = if !sections.is_empty()
-                                || has_unresolved_readlane
-                                || has_swizzle_or_dpp
-                            {
-                                64 * virtual_waves
-                            } else {
-                                0
-                            };
-                            ballot_base = title_lds_dwords;
-                            exchange_base = title_lds_dwords + ballot_dwords;
-                            let emu_dwords = ballot_dwords + exchange_dwords;
-                            s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
-                            lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
-                            cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
-                        }
-                        if total_threads > 1 && total_threads <= 64 && has_lds_mem && !has_s_barrier
-                        {
-                            need_lds_barriers = true;
                         }
                     }
                 }
             }
-        }
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -1342,15 +1346,14 @@ impl<'a> Lower<'a> {
                         LaneExit::Branch { when, .. } => Some(when),
                         _ => None,
                     });
-                    let mut all: Vec<Bool> = x
-                        .st
-                        .guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
+                    let mut all: Vec<Bool> =
+                        x.st.guards
+                            .iter()
+                            .flatten()
+                            .flatten()
+                            .copied()
+                            .chain(whens)
+                            .collect();
                     all.sort_unstable();
                     all.dedup();
                     all.into_iter().any(|g| {
@@ -1830,7 +1833,10 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(pre, Term::Br(spin));
         self.cur = spin;
         let iter = self.s.m.phi(spin, self.s.t.i32);
-        let now = self.s.m.atomic(spin, super::bitcode::Rmw::Add, counter, zero);
+        let now = self
+            .s
+            .m
+            .atomic(spin, super::bitcode::Rmw::Add, counter, zero);
         let reached = self.s.m.cmp(spin, pred::IUGE, now, target);
         let limit = super::spin_limit();
         #[cfg(test)]
@@ -9590,19 +9596,14 @@ impl<'a> Lower<'a> {
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
-            let args = if self.console_cf {
-                None
-            } else {
-                Some(
-                    self.x
-                        .st
-                        .phi_masks
-                        .get(&phi.value)
-                        .ok_or_else(|| {
-                            unsupported(offset, "a lane-mask join of an untracked mask")
-                        })?,
-                )
-            };
+            let args =
+                if self.console_cf {
+                    None
+                } else {
+                    Some(self.x.st.phi_masks.get(&phi.value).ok_or_else(|| {
+                        unsupported(offset, "a lane-mask join of an untracked mask")
+                    })?)
+                };
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -10112,7 +10113,7 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
-    } 
+    }
     #[test]
     fn image_atomics_64_bit_lower_with_typed_int64_flag() {
         use crate::native::{RootParam, RootType};
