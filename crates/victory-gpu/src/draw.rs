@@ -662,7 +662,7 @@ impl State {
                     // A mesh dispatch is the expensive op: with a split budget
                     // at or below this, each one gets its own submission, while
                     // draws and compute dispatches batch up to the budget.
-                    list.add_weight(64);
+                    list.add_weight(crate::host::HostList::mesh_weight());
                     true
                 }
                 Err(_) => false,

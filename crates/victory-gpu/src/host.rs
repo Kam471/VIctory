@@ -901,6 +901,20 @@ impl HostList {
         self.weight.load(Ordering::Relaxed)
     }
 
+    /// The weight of one mesh dispatch, for `VICTORY_MESH_WEIGHT`
+    /// (diagnostics): setting it at or above `VICTORY_LIST_SPLIT` gives each
+    /// mesh dispatch its own list, without splitting on a swarm of compute
+    /// dispatches. Default 64.
+    pub(crate) fn mesh_weight() -> u32 {
+        static BUDGET: OnceLock<u32> = OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_MESH_WEIGHT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(64)
+        })
+    }
+
     /// Whether the list should be split before the next command, for
     /// `VICTORY_LIST_SPLIT` (diagnostics): the recorded weight at which a
     /// list is cut. Unset or zero means no split.
