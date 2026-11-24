@@ -161,9 +161,12 @@ fn maybe_split(this: This) {
     if !current.wants_split() {
         return;
     }
-    let Ok(new) = host.new_list() else {
+    let Ok(mut new) = host.new_list() else {
         return;
     };
+    if crate::host::refresh_once_per_list() {
+        new.inherit_holds(&current);
+    }
     // SAFETY: the title passes one of our lists, and recording a list is
     // one thread at a time.
     let slot = unsafe { &mut (*this.cast_mut().cast::<List>()).host };

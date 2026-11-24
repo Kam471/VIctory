@@ -319,6 +319,9 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
+    /// Buffer ranges and textures already refreshed, shared with the lists
+    /// this one was split from (`VICTORY_REFRESH_ONCE_PER_LIST`).
+    holds: std::sync::Arc<Mutex<Holds>>,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -444,16 +447,36 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
-    /// Buffer ranges refreshed since the last title copy (host copy,
-    /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+/// Ranges and textures a title list has brought up to date. A split keeps
+/// the list it replaces's `Holds` with `VICTORY_REFRESH_ONCE_PER_LIST`, so
+/// the world's big buffers are not re-checked for writes before every
+/// submission (a world frame splits into hundreds of lists).
+#[derive(Default)]
+struct Holds {
+    /// Buffer ranges refreshed since the last title copy (host copy,
+    /// address, bytes): refreshing them again would find the same bytes.
+    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Textures whose contents the title list brings up to date.
+    textures: std::collections::HashSet<usize>,
+}
+
+/// Whether a split list keeps the refreshes of the list it continues
+/// (`VICTORY_REFRESH_ONCE_PER_LIST`). Off by default: a title write made
+/// between two splits, which only the write watch can see, would then be
+/// missed until the next title list.
+pub(crate) fn refresh_once_per_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_REFRESH_ONCE_PER_LIST")
+            .is_some_and(|v| !v.is_empty() && v != "0")
+    })
 }
 
 impl Host {
@@ -519,6 +542,7 @@ impl Host {
                 allocator,
                 list,
                 deferred: Mutex::default(),
+                holds: std::sync::Arc::new(Mutex::new(Holds::default())),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
@@ -1027,6 +1051,12 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        // A title list reset starts the refreshes over too.
+        {
+            let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+            holds.refreshed.clear();
+            holds.textures.clear();
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // A title list reset starts a fresh list for the split budget too.
@@ -1168,7 +1198,12 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        // Lock order: deferred, then holds (see `defer_refresh`).
+        self.holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refreshed
+            .clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1190,7 +1225,14 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
+        // Lock order: deferred, then holds (see `defer_copy`).
+        let first = self
+            .holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refreshed
+            .insert(key);
+        if first {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -1290,14 +1332,23 @@ impl HostList {
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
+        self.holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .textures
+            .insert(key)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        self.holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refreshed
+            .clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -1309,6 +1360,12 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Takes over the refreshes `from` already made, for a split
+    /// (`VICTORY_REFRESH_ONCE_PER_LIST`).
+    pub(crate) fn inherit_holds(&mut self, from: &HostList) {
+        self.holds = std::sync::Arc::clone(&from.holds);
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
