@@ -3457,8 +3457,8 @@ impl<'a> Lower<'a> {
         if self.ms.is_some() {
             // The allocation request's counts are staged at its own site and
             // applied by one `SetMeshOutputCounts` at the join (see
-            // `ms_counts_begin`). Only zero the staging dword here; the
-            // barrier at the join orders it with the load.
+            // `ms_counts_begin`). Initialize the staging dword before
+            // another wave can write its allocation request.
             let lds = self.ms.as_ref().expect("checked").lds;
             let zero = self.s.m.i32(0);
             let flat = self.mesh_thread();
@@ -3467,6 +3467,7 @@ impl<'a> Lower<'a> {
             let ptr = self.scratch_ptr(self.cur, lds, 0, zero, 0);
             self.s.m.store(self.cur, ptr, zero);
             self.end_guarded(at, &[]);
+            self.lds_barrier(self.cur);
             return Ok(());
         }
         let e = self.s.entry;
