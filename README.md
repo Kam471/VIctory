@@ -68,8 +68,9 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. A DualSense (USB or Bluetooth) is read over HID as well
+and plays as the first pad when no XInput pad answers. With no pad
+connected the keyboard is a pad while the title's window has focus:
 
 | Keys | Pad |
 |------|-----|
@@ -79,6 +80,10 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+The rate is shown in the window caption and in a small always-on-top
+counter over the title (`VICTORY_FPS_OVERLAY=0` turns the counter off);
+the counter also shows shader-cache hits and misses.
 
 ## Commands
 
@@ -112,6 +117,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_FPS_OVERLAY=0` | turns off the always-on-top frame-rate counter |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_INDIRECT=1` | runs the title's indirect draws and dispatches (off: the world's first frame stalls with it) |

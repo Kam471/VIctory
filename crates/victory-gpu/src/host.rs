@@ -4,14 +4,19 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{
+    BLACK_BRUSH, BeginPaint, CreateFontW, DeleteObject, EndPaint, FONT_CHARSET, FONT_CLIP_PRECISION,
+    FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HBRUSH, InvalidateRect,
+    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TextOutW, UpdateWindow, TRANSPARENT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -1240,6 +1245,130 @@ struct Meter {
     caption: Option<Vec<u16>>,
 }
 
+/// The FPS overlay's own window: a small always-on-top, click-through HUD
+/// over the title, so the rate is visible in fullscreen too.
+static OVERLAY_GAME: AtomicIsize = AtomicIsize::new(0);
+static OVERLAY_TEXT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Shows `text` in the overlay over `game`; `VICTORY_FPS_OVERLAY=0` turns it off.
+fn fps_overlay(game: HWND, text: &str) {
+    if std::env::var_os("VICTORY_FPS_OVERLAY").is_some_and(|v| v == "0") {
+        return;
+    }
+    OVERLAY_GAME.store(game.0 as isize, Ordering::Relaxed);
+    *OVERLAY_TEXT.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-fps".into())
+            .spawn(overlay_thread);
+    });
+}
+
+fn overlay_thread() {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        let class = w!("VictoryFpsOverlay");
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(overlay_proc),
+            hInstance: HINSTANCE(instance.0),
+            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        // RegisterClassW fails when the class already exists, which is fine.
+        let _ = RegisterClassW(&wc);
+        let hwnd = match CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class,
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            260,
+            34,
+            None,
+            None,
+            Some(HINSTANCE(instance.0)),
+            None,
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(_) => return,
+        };
+        // Black is the transparent colour: the brush paints the window's
+        // background and the green text stays.
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_COLORKEY);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        tracing::info!("FPS overlay shown");
+        loop {
+            let game = OVERLAY_GAME.load(Ordering::Relaxed);
+            if game != 0 {
+                let mut rect = RECT::default();
+                if GetWindowRect(HWND(game as *mut _), &mut rect).is_ok() {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND_TOPMOST),
+                        rect.left + 12,
+                        rect.top + 40,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
+            }
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            let _ = UpdateWindow(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
+extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let text = OVERLAY_TEXT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_default();
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLORREF(0x0000_ff00)); // 0x00BBGGRR: green
+            let font = CreateFontW(
+                -20,
+                0,
+                0,
+                0,
+                700,
+                0,
+                0,
+                0,
+                FONT_CHARSET(1),
+                FONT_OUTPUT_PRECISION(0),
+                FONT_CLIP_PRECISION(0),
+                FONT_QUALITY(4),
+                0,
+                w!("Segoe UI"),
+            );
+            let old = SelectObject(hdc, font.into());
+            let _ = TextOutW(hdc, 8, 6, &wide);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(font.into());
+            let _ = TextOutW(hdc, 8, 6, &wide);
+            SelectObject(hdc, old);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => DefWindowProcW(hwnd, msg, w, l),
+        _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
@@ -1266,6 +1395,13 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        let (cache_hits, cache_misses) = crate::shader_cache::counts();
+        fps_overlay(
+            hwnd,
+            &format!(
+                "VIctory  {fps:.1} FPS  {ms:.1} ms  {draws:.0} draws  shaders {cache_hits}h/{cache_misses}m"
+            ),
+        );
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
