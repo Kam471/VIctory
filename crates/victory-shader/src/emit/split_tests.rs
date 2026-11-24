@@ -69,7 +69,40 @@ const IN_HALF: &[u32] = &[
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
-    let (root, pso) = host.compute_pipeline(&cs)?;
+    dispatch(host, native, &cs, groups)
+}
+
+fn emit_options(
+    native: &crate::NativeProgram,
+    options: super::TranslateOptions,
+) -> Result<super::HostShader, String> {
+    let c = crate::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: vec![],
+    };
+    let p = crate::ir::build(&native.code, native.wave64, native.vgprs).map_err(|e| e.to_string())?;
+    let res = crate::resource::track(&p, &native.layout, native.stage).map_err(|e| e.to_string())?;
+    let io = crate::io::raise(&p, native).map_err(|e| e.to_string())?;
+    let st = crate::structure::structure(&p).map_err(|e| e.to_string())?;
+    super::emit_with(&c, native, &p, &st, &io, &res, options).map_err(|e| e.to_string())
+}
+
+fn dispatch(
+    host: &Host,
+    native: &crate::NativeProgram,
+    cs: &super::HostShader,
+    groups: u32,
+) -> Result<Vec<u32>, String> {
+    // The validator, where one is installed: drivers take some modules it
+    // refuses.
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut cs.dxil.clone())
+            .map_err(|e| format!("validation: {e}"))?;
+    }
+    let (root, pso) = host.compute_pipeline(cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
     let StageIo::Cs(io) = &native.io else {
         unreachable!()
@@ -276,6 +309,49 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
+/// The runtime's `Wave32` mode takes the console flow first where the host
+/// has no 64-lane waves: a lane read in a divergent branch used to stop the
+/// local virtual-wave emulation.
+#[test]
+fn wave32_mode_uses_the_console_flow_for_paired_hosts() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let target = host.target();
+        if target.runs(64) {
+            continue;
+        }
+        let p = program(&body, 64);
+        let options = super::TranslateOptions {
+            wave64: super::Wave64Mode::Wave32,
+            target,
+        };
+        let cs = emit_options(&p, options).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "{name}: the declared wave size");
+        let groups = 2;
+        let out = dispatch(&host, &p, &cs, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let expect: Vec<u32> = (0..groups)
+            .flat_map(|_| (0..64).map(|t| if t < 20 { 10 } else { 1 }))
+            .collect();
+        assert_eq!(out, expect, "{name}: Wave32 console flow");
+    }
+}
+
 /// Groups of several console waves need the halves to meet without a
 /// group barrier: not yet.
 #[test]
@@ -298,10 +374,8 @@ fn console_flow_is_for_one_console_wave_per_group() {
 /// the upper half's go on to 63, and the console wave loops while any lane
 /// does. After it, s9 holds lane 40's id, as the last iteration read it.
 ///
-/// The per-lane form (hosts with 64-lane waves) gets this wrong: a lane
-/// that left the loop is not there for the later iterations' lane reads,
-/// and a lane that skipped the loop never sees the scalar it set (on an
-/// RDNA2 iGPU, lane 0 ends with 0 and lanes 41 to 63 with t).
+/// The per-lane form got this wrong on every host (#225); hosts with
+/// 64-lane waves now run it in the console flow too, without exchanges.
 #[test]
 fn loops_run_while_any_lane_of_the_console_wave_does() {
     let body = [
@@ -321,7 +395,7 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
         0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
     ];
-    flow_case("loop t times reading lane 40", &body, 64, |t| t + 40, false);
+    console_flow_case("loop t times reading lane 40", &body, 64, |t| t + 40);
 }
 
 /// DPP's row mask names the console's rows: with `row_mask:0x3` only
@@ -354,4 +428,51 @@ fn first_lane_reads_are_the_console_waves() {
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
+}
+
+/// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
+/// it still writes lane 40. The per-lane form never had lane 40 there.
+#[test]
+fn lane_writes_reach_lanes_outside_the_branch() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0004, // s_cbranch_execz +4
+        0xBE89_03FF,
+        0x0000_004D, // s_mov_b32 s9, 77
+        0xD761_0002,
+        0x0001_5009, // v_writelane_b32 v2, s9, 40
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("if (lane < 20) writelane(40, 77)", &body, 64, |t| {
+        if t == 40 { 77 } else { 1 }
+    });
+}
+
+/// The loop form compilers emit: lanes that are done are added to an exit
+/// mask that starts as 0, EXEC loses them, and the mask restores EXEC
+/// after the loop. Lane t runs t + 1 iterations with a read of lane 40 in
+/// each; afterwards every lane has s9 = 40 and counts all 64 lanes in the
+/// exit mask.
+#[test]
+fn loops_with_an_exit_mask_grown_from_zero() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFF9, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE8C_100A, // s_bcnt1_i32_b64 s12, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x4A04_040C, // v_add_nc_u32 v2, s12, v2
+    ];
+    console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
 }

@@ -66,14 +66,25 @@ pub(crate) struct Parts<'a> {
     pub per_lane_only: bool,
 }
 
-/// What [`lower`] stops with when a wave64 program needs its two 32-lane
-/// halves to exchange values on a host without 64-lane waves: lower it
-/// again from [`crate::structure::structure_console`] with
-/// [`Parts::console_cf`]. Every lane of the group (one console wave) then
-/// runs every block, branches are the console's (taken wave-wide, from
-/// masks both halves exchange through group-shared memory), and EXEC
-/// guards the vector instructions; both halves reach every exchange, so
-/// a group barrier orders it.
+/// What [`lower`] stops with when a program should run as the console runs
+/// it: lower it again from [`crate::structure::structure_console`] with
+/// [`Parts::console_cf`]. Every lane of a console wave then runs every
+/// block, branches are the console's (taken wave-wide) and EXEC guards the
+/// vector instructions. Two kinds of program ask for it:
+///
+/// * a wave64 program whose two 32-lane halves must exchange values on a
+///   host without 64-lane waves (a group of one console wave): the wave-wide
+///   tests come from masks both halves exchange through group-shared
+///   memory, and both halves reach every exchange, so a group barrier
+///   orders it;
+/// * on any host, a program that reads or writes a named lane
+///   (`v_readlane`, `v_writelane`) and has branches its lanes take
+///   differently. Those instructions ignore EXEC on the console, and a wave
+///   runs a loop while any lane does; in the per-lane form a lane that left
+///   a loop (or skipped a branch) is not there to be read, and never sees
+///   the scalars set inside. One host wave is the console wave here, so
+///   nothing is exchanged. If the console flow cannot lower such a program
+///   it keeps the per-lane form ([`Parts::per_lane_only`]).
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
 enum Stop {
@@ -1092,42 +1103,41 @@ impl<'a> Lower<'a> {
                 Wave64Mode::Native
             };
 
+            // On a host without 64-lane waves, a wave64 program whose lanes
+            // read only their own half runs as two 32-lane waves: what each
+            // lane reads is in its host wave, at its host lane's place in the
+            // row. Not with LDS (the console compiler may leave out barriers
+            // between the halves) nor whole-wave sections (their reductions
+            // become wave operations over the host's wave).
+            // (`v_readfirstlane` reads the console wave's first lane, which
+            // the upper half does not hold: such programs take the console
+            // flow below.)
+            let paired_host =
+                x.native.wave64 && !x.target.runs(64) && x.target.runs(32);
+            let pr_split = paired_host
+                && console_lanes
+                && !reads_whole
+                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
+                && !masks_held
+                && s.lds_dwords == 0
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // The rest of such programs need the halves to exchange values
+            // (masks read whole, lanes of the other half): the console flow,
+            // for a group of one console wave without LDS.
+            let pr_console = paired_host
+                && console_lanes
+                && !pr_split
+                && s.lds_dwords == 0
+                && cs.threads.iter().product::<u32>() <= 64
+                && !insts().any(|i| i.name().contains("permute"))
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+
             match req_mode {
                 Wave64Mode::Native => {
                     let wave = if x.native.wave64 { 64 } else { 32 };
                     let one_wave = total_threads <= wave;
-                    // On a host without 64-lane waves, a wave64 program whose
-                    // lanes read only their own half runs as two 32-lane
-                    // waves: what each lane reads is in its host wave, at its
-                    // host lane's place in the row. Not with LDS (the console
-                    // compiler may leave out barriers between the halves) nor
-                    // whole-wave sections (their reductions become wave
-                    // operations over the host's wave).
-                    // (`v_readfirstlane` reads the console wave's first lane,
-                    // which the upper half does not hold: such programs take
-                    // the console flow below.)
-                    split = console_lanes
-                        && x.native.wave64
-                        && !reads_whole
-                        && !insts().any(|i| i.name() == "v_readfirstlane_b32")
-                        && !masks_held
-                        && s.lds_dwords == 0
-                        && !x.target.runs(64)
-                        && x.target.runs(32)
-                        && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
-                    // The rest of such programs need the halves to exchange
-                    // values (masks read whole, lanes of the other half):
-                    // the console flow, for a group of one console wave
-                    // without LDS.
-                    wants_console_flow = console_lanes
-                        && !split
-                        && x.native.wave64
-                        && !x.target.runs(64)
-                        && x.target.runs(32)
-                        && s.lds_dwords == 0
-                        && cs.threads.iter().product::<u32>() <= 64
-                        && !insts().any(|i| i.name().contains("permute"))
-                        && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                    split = pr_split;
+                    wants_console_flow = pr_console;
                     // On a host that runs the console's wave size: lane reads
                     // and writes in a program whose lanes branch differently
                     // (see [`CONSOLE_FLOW`]).
@@ -1159,6 +1169,26 @@ impl<'a> Lower<'a> {
                     }
                 }
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
+                    // Wave32 keeps the local virtual-wave emulation for what
+                    // the console flow cannot take, but lets the console flow
+                    // handle first what it covers (in-half halves and groups
+                    // of one console wave).
+                    if req_mode == Wave64Mode::Wave32
+                        && (x.console_cf || pr_split || pr_console)
+                    {
+                        wave64 = Wave64Mode::Native;
+                        split = if x.console_cf {
+                            x.native.wave64 && !x.target.runs(64)
+                        } else {
+                            pr_split
+                        };
+                        wants_console_flow = pr_console && !x.console_cf;
+                        if split {
+                            s.wave_size = Some(32);
+                        } else if console_lanes {
+                            s.wave_size = Some(if x.native.wave64 { 64 } else { 32 });
+                        }
+                    } else {
                     spills = spilled_sgprs(p);
                     (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
                     let has_non_uniform_firstlane = insts().any(|i| {
@@ -1237,6 +1267,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        }
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -2898,8 +2929,7 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
-            let word = self.ballot_word(at, bit);
-            let xy = self.exchange(at, word);
+            let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
         }
@@ -3961,6 +3991,10 @@ impl<'a> Lower<'a> {
     /// Console flow: `x` of console lane `lane` (uniform), from whichever
     /// half holds it.
     fn console_read_lane(&mut self, x: V, lane: V) -> V {
+        if !self.split {
+            // One host wave is the console wave, all of its lanes here.
+            return self.read_lane(x, lane);
+        }
         let c = self.cur;
         let (k31, k5, one, z) = (
             self.s.m.i32(31),
@@ -6692,7 +6726,12 @@ impl<'a> Lower<'a> {
                         _ => Err(LANE_MASK),
                     }
                 };
-                let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+                let lo = word(self, EXEC)?;
+                let hi = if self.x.native.wave64 {
+                    word(self, EXEC + 1)?
+                } else {
+                    self.s.m.i32(0)
+                };
                 let i32t = self.s.t.i32;
                 let flo = self
                     .s
@@ -9353,11 +9392,27 @@ impl<'a> Lower<'a> {
     fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;
-        let lo = self.ballot_word(c, bit);
-        let (lo, hi) = self.exchange(c, lo);
+        let (lo, hi) = self.console_ballot(c, bit);
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, pred::NE, or, z))
+    }
+
+    /// Console flow: the console wave's ballot of `bit`, low and high word.
+    fn console_ballot(&mut self, at: usize, bit: V) -> (V, V) {
+        if self.split {
+            let word = self.ballot_word(at, bit);
+            return self.exchange(at, word);
+        }
+        // One host wave is the console wave (the high word is 0 in waves
+        // of 32).
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
     }
 
     /// The host wave's ballot of `bit` (32 lanes: the first word).
@@ -9411,14 +9466,14 @@ impl<'a> Lower<'a> {
         f
     }
 
-    /// Split: this lane's console lane (0..63) and half (0, 1).
+    /// This lane's console lane (0..63, 0..31 in waves of 32) and its
+    /// half of a wave64 (0, 1).
     fn console_lane(&mut self) -> (V, V) {
         let f = self.console_flat();
         let e = self.s.entry;
-        let (k63, k5, one) = (self.s.m.i32(63), self.s.m.i32(5), self.s.m.i32(1));
-        let lane = self.s.m.bin(e, Bin::And, f, k63);
-        let h = self.s.m.bin(e, Bin::LShr, f, k5);
-        let half = self.s.m.bin(e, Bin::And, h, one);
+        let (mask, k5) = (self.s.m.i32(self.wave() - 1), self.s.m.i32(5));
+        let lane = self.s.m.bin(e, Bin::And, f, mask);
+        let half = self.s.m.bin(e, Bin::LShr, lane, k5);
         (lane, half)
     }
 
