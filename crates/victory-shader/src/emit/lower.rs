@@ -132,6 +132,24 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// Mesh: the console's `GS_ALLOC_REQ` output counts, staged in group-shared
+/// memory and applied once at the point every path from the request joins.
+///
+/// The console lets one lane request the allocation and reads the result from
+/// that lane (`v_readfirstlane`); DXIL instead requires one
+/// `SetMeshOutputCounts` call that all threads reach and that dominates every
+/// output write. The request's `m0` is therefore stored to LDS under the
+/// lane guard and read by the whole group after a barrier at the join.
+struct MsCounts {
+    /// IR block and instruction of every allocation request.
+    sites: Vec<(usize, usize)>,
+    /// The immediate postdominator all requests share: every path from a
+    /// request reaches it (and the console's real exports come after it).
+    join: usize,
+    /// LDS dword the request's `m0` value is staged in.
+    lds: u32,
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -216,6 +234,11 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Mesh: the console's allocation request, when its counts can be
+    /// applied through DXIL (one uniform `SetMeshOutputCounts` at the join).
+    ms: Option<MsCounts>,
+    /// Immediate dominators of the IR blocks (computed over `rpo`).
+    idom: Vec<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -414,6 +437,133 @@ fn compute_sections(p: &Program) -> (Sections, HashSet<Value>) {
         }
     }
     (sections, section_out)
+}
+
+/// Whether `a` dominates `b` in the tree `idom` (`idom[x] == x` at the entry).
+fn dominates(idom: &[usize], a: usize, b: usize) -> bool {
+    let mut q = b;
+    while q < idom.len() {
+        if q == a {
+            return true;
+        }
+        let d = idom[q];
+        if d == q || d == usize::MAX {
+            return false;
+        }
+        q = d;
+    }
+    false
+}
+
+/// Plans the host form of a console mesh `GS_ALLOC_REQ`:
+///
+/// * every request has an `m0` value;
+/// * the requests share one immediate postdominator, a thread-group uniform
+///   block (every thread arrives there) that dominates every export;
+/// * one more LDS dword fits.
+///
+/// Under those conditions the requests' counts can be staged in LDS and
+/// applied by one `SetMeshOutputCounts` call at the join, which is the only
+/// shape the DXIL validator accepts (one call, dominating every output write).
+fn ms_counts_plan(
+    p: &Program,
+    st: &Structured,
+    uniform: &[bool],
+    lds_dwords: u32,
+) -> Option<MsCounts> {
+    let n = p.blocks.len();
+    if n == 0 || lds_dwords.saturating_add(1) > 8192 {
+        return None;
+    }
+    let mut sites = Vec::new();
+    for (b, blk) in p.blocks.iter().enumerate() {
+        for (i, inst) in blk.insts.iter().enumerate() {
+            if inst.name() == "s_sendmsg"
+                && matches!(inst.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+            {
+                sites.push((b, i));
+            }
+        }
+    }
+    if sites.is_empty() {
+        return None;
+    }
+    for &(b, i) in &sites {
+        if p.blocks[b].insts[i].read(Reg::S(crate::ir::M0)).is_none() {
+            return None;
+        }
+    }
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; n];
+    for (k, &b) in order.iter().enumerate() {
+        index[b] = k;
+    }
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let mut succs = vec![Vec::new(); n];
+    let mut fwd = vec![false; n];
+    for &b in &order {
+        fwd[b] = true;
+        match st.exits[b] {
+            LaneExit::Jump(t) => succs[b].push(t),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => {
+                succs[b].push(taken);
+                if not_taken != taken {
+                    succs[b].push(not_taken);
+                }
+            }
+            LaneExit::End => succs[b].push(n),
+            LaneExit::Indirect => {}
+        }
+    }
+    let (_, ipdom) = compute_postdoms(n, &succs, &fwd);
+    let join = *ipdom.get(sites[0].0)?;
+    if join >= n || !uniform.get(join).copied().unwrap_or(false) {
+        return None;
+    }
+    for &(b, _) in &sites {
+        if join == b || ipdom[b] != join {
+            return None;
+        }
+    }
+    // One call means the join must run once: a path from it back to itself
+    // would call `SetMeshOutputCounts` again.
+    let mut seen = vec![false; n];
+    let mut stack = succs[join].clone();
+    while let Some(x) = stack.pop() {
+        if x == join {
+            return None;
+        }
+        if x >= n || seen[x] {
+            continue;
+        }
+        seen[x] = true;
+        stack.extend_from_slice(&succs[x]);
+    }
+    // Every export must come after the counts are declared, unless it is on
+    // one request's own path (the console's dummy null primitive), where it
+    // is suppressed.
+    let mut exports = 0usize;
+    for (b, blk) in p.blocks.iter().enumerate() {
+        for q in &blk.insts {
+            if matches!(q.fields, Fields::Exp { .. }) {
+                exports += 1;
+                let on_request_path = sites.iter().any(|&(rb, _)| dominates(&idom, rb, b));
+                if !dominates(&idom, join, b) && !on_request_path {
+                    return None;
+                }
+            }
+        }
+    }
+    if exports == 0 {
+        return None;
+    }
+    Some(MsCounts {
+        sites,
+        join,
+        lds: lds_dwords,
+    })
 }
 
 /// Immediate post-dominator per block (or virtual exit `n`) using Cooper-Harvey-Kennedy.
@@ -1096,6 +1246,18 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // The console's allocation request carries the group's output counts
+        // in `m0`. Stage them in one LDS dword so one uniform
+        // `SetMeshOutputCounts` at the join can apply them (the validator
+        // rejects a call per path, and requires the call to dominate every
+        // output write).
+        let mut ms_counts = None;
+        if let StageIo::Ms(_) = &x.native.io
+            && let Some(plan) = ms_counts_plan(p, x.st, &uniform, s.lds_dwords)
+        {
+            s.lds_dwords += 1;
+            ms_counts = Some(plan);
+        }
         Lower {
             s,
             x,
@@ -1153,6 +1315,8 @@ impl<'a> Lower<'a> {
             ballot_fail: HashMap::new(),
             flat: None,
             no_barrier,
+            ms: ms_counts,
+            idom: Vec::new(),
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -2074,6 +2238,11 @@ impl<'a> Lower<'a> {
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
+        let mut index = vec![usize::MAX; p.blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
+            index[b] = n;
+        }
+        self.idom = crate::ir::idoms(&p.blocks, &order, &index);
         for (n, &b) in order.iter().enumerate() {
             self.block[b] = Some(if n == 0 {
                 self.s.entry
@@ -2133,6 +2302,10 @@ impl<'a> Lower<'a> {
                     }
                 };
                 self.vals.insert(phi.value, val);
+            }
+            if self.ms.as_ref().is_some_and(|m| m.join == b) {
+                self.ms_counts_begin()
+                    .map_err(|w| unsupported(p.blocks[b].offset, w))?;
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
@@ -3148,14 +3321,113 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Mesh: the counts and the primitives no lane exports. The console's
-    /// counts come from one lane's allocation request, which DXIL cannot
-    /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
-    // program's count are culled and vertices past it unused; this costs
-    // the host the unused vertex and primitive slots. Pass the program's own
-    // counts if that shows in frame time.
+    /// Mesh: stages the allocation request's `m0` (vertices | primitives
+    /// << 12) in the plan's LDS dword. The console leaves this to one lane;
+    /// the value is an SGPR, so every thread stores the same number.
+    fn ms_store_counts(&mut self, inst: &Inst) -> Result<(), Why> {
+        let v = inst
+            .read(Reg::S(crate::ir::M0))
+            .ok_or("an allocation request without m0")?;
+        let x = self.i32_of(v)?;
+        let lds = self.ms.as_ref().expect("the request site").lds;
+        let zero = self.s.m.i32(0);
+        let ptr = self.scratch_ptr(self.cur, lds, 0, zero, 0);
+        self.s.m.store(self.cur, ptr, x);
+        Ok(())
+    }
+
+    /// Mesh: declares the counts the console's allocation request asked for
+    /// (`m0`'s low 12 bits are vertices, the next 12 primitives) and culls
+    /// every declared primitive before the program's own exports overwrite
+    /// them. Runs at the join, where every thread arrives and where the
+    /// request's LDS value is visible.
+    fn ms_counts_begin(&mut self) -> Result<(), Why> {
+        let lds = self.ms.as_ref().expect("the join").lds;
+        self.lds_barrier(self.cur);
+        let zero = self.s.m.i32(0);
+        let ptr = self.scratch_ptr(self.cur, lds, 0, zero, 0);
+        let packed = self.s.m.load(self.cur, ptr);
+        let c = self.cur;
+        let k = self.s.m.i32(0xFFF);
+        let mut v = self.s.m.bin(c, Bin::And, packed, k);
+        let k12 = self.s.m.i32(12);
+        let p = self.s.m.bin(c, Bin::LShr, packed, k12);
+        let mut p = self.s.m.bin(c, Bin::And, p, k);
+        let mesh = self.s.mesh.expect("mesh");
+        let (maxv, maxp) = (
+            self.s.m.i32(mesh.max_vertices),
+            self.s.m.i32(mesh.max_primitives),
+        );
+        let over = self.s.m.cmp(c, pred::IUGT, v, maxv);
+        v = self.s.m.select(c, over, maxv, v);
+        let over = self.s.m.cmp(c, pred::IUGT, p, maxp);
+        p = self.s.m.select(c, over, maxp, p);
+        let void = self.s.t.void;
+        self.s.op(
+            self.cur,
+            "setMeshOutputCounts",
+            Attr::NoUnwind,
+            void,
+            168,
+            &[v, p],
+        );
+        // Every declared primitive starts culled: three indices of vertex 0,
+        // whose position is defined below. The program's exports overwrite
+        // the primitives and vertices it actually uses.
+        let flat = self.mesh_thread();
+        let guard = self.s.m.cmp(self.cur, pred::IULT, flat, p);
+        let at = self.begin_guarded(Some(guard));
+        let z = self.s.m.i32(0);
+        self.s.op(
+            self.cur,
+            "emitIndices",
+            Attr::NoUnwind,
+            void,
+            169,
+            &[flat, z, z, z],
+        );
+        self.end_guarded(at, &[]);
+        // Vertex 0 is the only vertex a culled primitive names, and the
+        // console's dummy export writes no position for it. A defined
+        // position makes the all-zero indices a real zero-area triangle
+        // instead of three undefined (possibly NaN) positions.
+        let Some(id) = self.s.outputs.iter().position(|o| o.kind == 3) else {
+            return Ok(());
+        };
+        if self.s.outputs[id].half {
+            return Ok(());
+        }
+        let is0 = self.s.m.cmp(self.cur, pred::EQ, flat, zero);
+        let at = self.begin_guarded(Some(is0));
+        let idv = self.s.m.i32(id as u32);
+        let cols = self.s.outputs[id].cols.min(4);
+        for ch in 0..cols {
+            let val = if ch == 3 {
+                self.s.m.f32(0x3F80_0000)
+            } else {
+                self.s.m.f32(0)
+            };
+            let chv = self.s.m.i8(ch);
+            self.s.op(
+                self.cur,
+                "storeVertexOutput.f32",
+                Attr::NoUnwind,
+                void,
+                171,
+                &[idv, zero, chv, val, zero],
+            );
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Mesh: the counts and the primitives no lane exports. When the
+    /// console's allocation request could be planned ([`MsCounts`]), the
+    /// counts are applied at its join instead; otherwise they are the
+    /// declared maxima and each lane first culls its primitive (all indices
+    /// 0, zero area), so primitives past the program's count are culled and
+    /// vertices past it unused; this costs the host the unused vertex and
+    /// primitive slots.
     fn mesh_prologue(&mut self, mut mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {
@@ -3180,7 +3452,22 @@ impl<'a> Lower<'a> {
             // still emitted, as before, with the lower maxima: drivers have
             // been seen to take such modules, and refusing them would drop
             // draws that may work today.
-            self.s.mesh = Some(mesh);
+        }
+        self.s.mesh = Some(mesh);
+        if self.ms.is_some() {
+            // The allocation request's counts are staged at its own site and
+            // applied by one `SetMeshOutputCounts` at the join (see
+            // `ms_counts_begin`). Only zero the staging dword here; the
+            // barrier at the join orders it with the load.
+            let lds = self.ms.as_ref().expect("checked").lds;
+            let zero = self.s.m.i32(0);
+            let flat = self.mesh_thread();
+            let is0 = self.s.m.cmp(self.cur, pred::EQ, flat, zero);
+            let at = self.begin_guarded(Some(is0));
+            let ptr = self.scratch_ptr(self.cur, lds, 0, zero, 0);
+            self.s.m.store(self.cur, ptr, zero);
+            self.end_guarded(at, &[]);
+            return Ok(());
         }
         let e = self.s.entry;
         let void = self.s.t.void;
@@ -3538,12 +3825,20 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            // The staged allocation counts drive every declared primitive.
+            || self
+                .ms
+                .as_ref()
+                .is_some_and(|m| m.sites.contains(&(b, i)))
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
+            Fields::Sopp { .. } if self.ms.as_ref().is_some_and(|m| m.sites.contains(&(b, i))) => {
+                self.ms_store_counts(inst)
+            }
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
@@ -7488,6 +7783,18 @@ impl<'a> Lower<'a> {
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
+        // The console's allocation must happen before any output exists. The
+        // exports on the request's own path (its dummy null primitive) come
+        // before the counts are declared, where DXIL forbids output writes;
+        // the counts path emits a culled primitive for every slot instead.
+        if self
+            .ms
+            .as_ref()
+            .is_some_and(|m| !dominates(&self.idom, m.join, b))
+        {
+            return Ok(());
+        }
+        // (The plan only admits such exports on a request's own path.)
         let e = *self
             .exports
             .get(&(b, i))

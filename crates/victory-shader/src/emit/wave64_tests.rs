@@ -458,7 +458,7 @@ mod gpu {
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
-    use crate::emit::host::{Dispatch, Host, View};
+    use crate::emit::host::{Dispatch, Draw, Host, View};
 
     fn with_hosts(f: impl FnOnce(&[Option<Host>; 2])) {
         static HOSTS: OnceLock<Mutex<[Option<Host>; 2]>> = OnceLock::new();
@@ -643,7 +643,7 @@ mod gpu {
 
     /// A minimal pixel shader for a mesh pipeline, compiled with a `dxc` on
     /// PATH (none: `None`, and mesh drawing tests are skipped).
-    fn trivial_ps() -> Option<Vec<u8>> {
+    fn compile_ps(source: &str) -> Option<Vec<u8>> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         let dxc = std::env::var_os("VICTORY_PC_DXC").unwrap_or_else(|| "dxc".into());
@@ -655,7 +655,7 @@ mod gpu {
         std::fs::create_dir_all(&dir).ok()?;
         let src = dir.join("mps.hlsl");
         let out = dir.join("mps.dxil");
-        std::fs::write(&src, "float4 main() : SV_Target { return 0; }\n").ok()?;
+        std::fs::write(&src, source).ok()?;
         let status = std::process::Command::new(&dxc)
             .args(["-T", "ps_6_6", "-E", "main", "-Fo"])
             .arg(&out)
@@ -668,11 +668,33 @@ mod gpu {
         std::fs::read(&out).ok()
     }
 
+    fn trivial_ps() -> Option<Vec<u8>> {
+        compile_ps("float4 main() : SV_Target { return 0; }\n")
+    }
+
+    fn red_ps() -> Option<Vec<u8>> {
+        compile_ps("float4 main() : SV_Target { return float4(1, 0, 0, 1); }\n")
+    }
+
     /// Emits and validates `prog`, then creates the mesh pipeline a
     /// `DispatchMesh` needs (with a trivial pixel shader).
     fn mesh_pso(
         name: &str,
         prog: &NativeProgram,
+    ) -> Option<(
+        Host,
+        windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+        windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+        HostShader,
+    )> {
+        mesh_pso_with_ps(name, prog, trivial_ps())
+    }
+
+    /// [`mesh_pso`] with the pixel shader the drawing test needs.
+    fn mesh_pso_with_ps(
+        name: &str,
+        prog: &NativeProgram,
+        ps: Option<Vec<u8>>,
     ) -> Option<(
         Host,
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
@@ -687,7 +709,7 @@ mod gpu {
             v.validate(&mut shader.dxil.clone())
                 .unwrap_or_else(|e| panic!("{name}: validate: {e}"));
         }
-        let Some(ps) = trivial_ps() else {
+        let Some(ps) = ps else {
             eprintln!("{name}: no dxc for a pixel shader; PSO skipped");
             return None;
         };
@@ -734,6 +756,172 @@ mod gpu {
             )
             .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
         assert_eq!(&out[0][..expected.len()], expected, "{name}: output mismatch");
+    }
+
+    // ---- allocation counts (`s_sendmsg GS_ALLOC_REQ`, `m0`) ----
+
+    const S_SENDMSG_ALLOC_REQ: u32 = 0xBF90_0009;
+
+    fn s_movk_i32(dst: u32, imm: u16) -> u32 {
+        0xB000_0000 | (dst << 16) | u32::from(imm)
+    }
+    fn s_cmp_eq_u32(src0: u32, src1: u32) -> u32 {
+        sopc(0x06, src0, src1)
+    }
+    fn s_branch(delta_words: i16) -> u32 {
+        sopp(0x02, delta_words)
+    }
+    fn s_nop() -> u32 {
+        sopp(0x00, 0)
+    }
+    fn v_literal(dst: u32, bits: u32) -> [u32; 2] {
+        [v_mov_b32(dst, LIT), bits]
+    }
+
+    /// A 128-thread mesh program that requests `packed` (vertices, then
+    /// primitives << 12) and takes one of two paths into a join: the
+    /// request's immediate postdominator, where the host declares the
+    /// counts. The join is at word 7.
+    fn ms_alloc_counts_head(packed: u16) -> Vec<u32> {
+        vec![
+            s_movk_i32(124, packed), // m0
+            S_SENDMSG_ALLOC_REQ,
+            s_mov_b32(30, inline_u(0)),
+            s_cmp_eq_u32(30, inline_u(0)),
+            s_cbranch_scc1(2), // -> join
+            s_branch(1),       // -> join
+            s_nop(),           // the other path
+        ]
+    }
+
+    /// Every thread exports the same full-screen triangle (vertices
+    /// 0, 1, 2 and indices (0,1,2)); only the declared counts are used.
+    fn emit_ms_screen_triangle(code: &mut Vec<u32>) {
+        code.extend_from_slice(&v_literal(14, (-1.0f32).to_bits()));
+        code.extend_from_slice(&v_literal(15, 3.0f32.to_bits()));
+        code.push(v_cmp_eq_u32(inline_u(1), 0)); // vcc = (tid == 1)
+        code.extend_from_slice(&v_cndmask_b32(10, vgpr(14), vgpr(15), VCC));
+        code.push(v_cmp_eq_u32(inline_u(2), 0)); // vcc = (tid == 2)
+        code.extend_from_slice(&v_cndmask_b32(11, vgpr(14), vgpr(15), VCC));
+        code.extend_from_slice(&v_literal(12, 0));
+        code.extend_from_slice(&v_literal(13, 1.0f32.to_bits()));
+        code.extend_from_slice(&v_literal(9, 0 | 1 << 10 | 2 << 20));
+        code.push(0xF800_08CF); // exp pos0, v10..v13 done
+        code.push(10 | 11 << 8 | 12 << 16 | 13 << 24);
+        code.push(0xF800_0941); // exp prim, v9, off, off, off done
+        code.push(9);
+    }
+
+    /// The console's dummy export for a group with nothing to draw: a null
+    /// primitive (bit 31) and no position.
+    fn emit_ms_culled_export(code: &mut Vec<u32>) {
+        code.extend_from_slice(&v_literal(9, 0x8000_0000));
+        code.push(0xF800_08C0); // exp pos0, off, off, off, off done
+        code.push(0);
+        code.push(0xF800_0941); // exp prim, v9, off, off, off done
+        code.push(9);
+    }
+
+    fn ms_alloc_counts_program(culled: bool) -> NativeProgram {
+        // (1, 1) is what the console's dummy path requests; (3, 3) matches
+        // the triangle below.
+        let packed = if culled { 0x1001 } else { 0x3003 };
+        let mut code = ms_alloc_counts_head(packed);
+        if culled {
+            emit_ms_culled_export(&mut code);
+        } else {
+            emit_ms_screen_triangle(&mut code);
+        }
+        code.push(S_ENDPGM);
+        make_ms_program(&code, 128, 0, 128, 128)
+    }
+
+    /// The translated forms must validate: one `setMeshOutputCounts` call
+    /// (the validator rejects a call per path), reached by every thread and
+    /// dominating every output write.
+    #[test]
+    fn mesh_alloc_counts_translate_and_validate() {
+        for culled in [false, true] {
+            let prog = ms_alloc_counts_program(culled);
+            let shader = emit_ms(&prog, Wave64Mode::Emulate)
+                .unwrap_or_else(|e| panic!("culled={culled}: {e}"));
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("culled={culled}: validate: {e}"));
+            }
+        }
+    }
+
+    /// A group whose request allocates only the console's dummy slot (one
+    /// vertex, one primitive) rasterizes nothing, while the same program
+    /// with counts that declare the triangle draws it. This is the
+    /// allocation-count overdraw: with the declared maxima instead of `m0`,
+    /// the culled group would still launch 128 primitives.
+    #[test]
+    fn gpu_mesh_alloc_counts_culled_group_draws_nothing() {
+        let draw = |groups| Draw {
+            roots: Vec::new(),
+            textures: &[],
+            samplers: &[],
+            vertices: &[],
+            stride: 0,
+            size: (8, 8),
+            mesh_groups: groups,
+        };
+        let culled = ms_alloc_counts_program(true);
+        let Some((host, root, pso, _)) = mesh_pso_with_ps("alloc_counts_culled", &culled, red_ps())
+        else {
+            return;
+        };
+        let pixels = host
+            .draw(&root, &pso, &draw(1))
+            .unwrap_or_else(|e| panic!("culled draw: {e}"));
+        assert!(
+            pixels.iter().all(|p| p[0] < 0.5),
+            "a culled allocation-count group rasterized: {pixels:?}"
+        );
+
+        let real = ms_alloc_counts_program(false);
+        let Some((host, root, pso, _)) = mesh_pso_with_ps("alloc_counts_real", &real, red_ps())
+        else {
+            return;
+        };
+        let pixels = host
+            .draw(&root, &pso, &draw(1))
+            .unwrap_or_else(|e| panic!("real draw: {e}"));
+        assert!(
+            pixels.iter().any(|p| p[0] > 0.5),
+            "a 3-vertex allocation-count group rasterized nothing: {pixels:?}"
+        );
+    }
+
+    /// The culled form must be cheap: unlike the declared maxima, its one
+    /// allocated primitive is degenerate and never rasterizes.
+    #[test]
+    fn gpu_mesh_alloc_counts_culled_dispatch_cost() {
+        let dispatch = Dispatch {
+            roots: Vec::new(),
+            views: &[],
+            samplers: &[],
+            groups: [1, 1, 1],
+        };
+        for (name, culled) in [("culled", true), ("real", false)] {
+            let prog = ms_alloc_counts_program(culled);
+            let Some((host, root, pso, _)) = mesh_pso(name, &prog) else {
+                return;
+            };
+            host.dispatch_mesh_repeat(&root, &pso, &dispatch, 4, 2)
+                .unwrap_or_else(|e| panic!("{name}: warm-up: {e}"));
+            let count = 200u32;
+            let start = std::time::Instant::now();
+            host.dispatch_mesh_repeat(&root, &pso, &dispatch, 4, count)
+                .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
+            let ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(count);
+            eprintln!("alloc counts {name}: {ms:.3} ms per 4-group dispatch");
+            assert!(ms < 20.0, "alloc counts {name}: {ms:.3} ms per dispatch");
+        }
     }
 
     #[test]
