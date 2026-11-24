@@ -1597,6 +1597,7 @@ mod gpu {
             eprintln!(
                 "{name}: {per:.3} ms per dispatch (1024 loop iterations, 8 non-uniform firstlanes)"
             );
+            assert!(per < 1000.0, "{name}: {per:.3} ms per dispatch");
         }
     }
 
@@ -1640,5 +1641,15 @@ mod gpu {
                 "{name}: {per:.3} ms per dispatch ({iters} loop iterations, 8 firstlanes; LDS {shared} B)"
             );
         }
+    }
+
+    #[test]
+    fn a_mesh_wave_rendezvous_stops_at_the_spin_limit() {
+        use std::sync::atomic::Ordering;
+        super::super::lower::WAVE_BARRIER_LIMIT.store(0, Ordering::Relaxed);
+        let prog = make_ms_program(&ms_firstlane_nonuniform_loop_program(1), 128, 0, 128, 1);
+        emit_ms(&prog, Wave64Mode::Native).unwrap();
+        let limit = super::super::lower::WAVE_BARRIER_LIMIT.load(Ordering::Relaxed);
+        assert_eq!(limit, super::super::spin_limit());
     }
 }

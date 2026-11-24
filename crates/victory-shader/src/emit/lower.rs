@@ -262,6 +262,11 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// The last [`Lower::wave_barrier`] timeout emitted, for its test.
+#[cfg(test)]
+pub(super) static WAVE_BARRIER_LIMIT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -1366,8 +1371,13 @@ impl<'a> Lower<'a> {
     /// `before - before % n + n` is the same target for every lane. No
     /// reset or generation is needed, so a wave can pass this point any
     /// number of times while another wave is elsewhere.
+    ///
+    /// The wait stops at [`super::spin_limit`], like a title spin wait: a
+    /// correct program has every lane of the wave arrive, so one round is
+    /// enough, but a missed arrival (an emulation bug, or a lane the host
+    /// never schedules) must not spin 2^20 times on one LDS atomic and take
+    /// the device past its TDR on its own.
     fn wave_barrier(&mut self) {
-        const SPIN_LIMIT: u32 = 1 << 20;
         debug_assert_eq!(self.guard_depth, 0);
         let c = self.cur;
         let base = self.wave_barrier_base;
@@ -1392,7 +1402,10 @@ impl<'a> Lower<'a> {
         let iter = self.s.m.phi(spin, self.s.t.i32);
         let now = self.s.m.atomic(spin, super::bitcode::Rmw::Add, counter, zero);
         let reached = self.s.m.cmp(spin, pred::IUGE, now, target);
-        let limit = self.s.m.i32(SPIN_LIMIT);
+        let limit = super::spin_limit();
+        #[cfg(test)]
+        WAVE_BARRIER_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+        let limit = self.s.m.i32(limit);
         let timed_out = self.s.m.cmp(spin, pred::IUGE, iter, limit);
         let exit = self.s.m.bin(spin, Bin::Or, reached, timed_out);
         let next = self.s.m.bin(spin, Bin::Add, iter, one);
