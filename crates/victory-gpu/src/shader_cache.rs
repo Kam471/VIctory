@@ -444,5 +444,12 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        // VSH2 named two incompatible layouts (16-bit registers, then the
+        // stride-table flag): neither may be read as this one.
+        assert_eq!(decode(b"VSH2"), None);
+
+        let mut plain = shader();
+        plain.stride_table = false;
+        assert_eq!(decode(&encode(&plain)), Some(plain));
     }
 }
