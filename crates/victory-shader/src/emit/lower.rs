@@ -219,13 +219,14 @@ enum Spill {
     Const(u32),
 }
 
-/// Iterations after which a loop is left (per entry into it). The console
-/// runs a loop as long as its data says; data the host has not mirrored
-/// yet (a null view reads zeros) can make that four billion iterations,
-/// which hangs the host GPU until the driver resets it. A lane that
-/// reaches the limit leaves the program as killed (a pixel discards).
+/// Iterations after which a loop is left (per entry into it), unless
+/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
+/// its data says; data the host has not mirrored yet (a null view reads
+/// zeros) can make that four billion iterations, which hangs the host GPU
+/// until the driver resets it. A lane that reaches the limit leaves the
+/// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
-const LOOP_LIMIT: u32 = 1 << 20;
+pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -1690,12 +1691,15 @@ impl<'a> Lower<'a> {
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
     /// would round to it (a tiny negative `a`), the result is `below_one`,
     /// the largest value under 1.0 in the operation's width. Hosts differ
-    /// here (some give 1.0). NaN stays NaN.
-    fn fract(&mut self, a: V, below_one: f32) -> V {
+    /// here (some give 1.0). Comparing against a `threshold` distinct from
+    /// `below_one` prevents drivers (observed on NVIDIA) from folding
+    /// `r > k ? k : r` into `minNum` (`FMNMX`) and swallowing NaN.
+    fn fract(&mut self, a: V, threshold: f32, below_one: f32) -> V {
         let c = self.cur;
         let r = self.unary(22, a);
+        let limit = self.s.m.f32(threshold.to_bits());
         let k = self.s.m.f32(below_one.to_bits());
-        let over = self.s.m.cmp(c, pred::OGT, r, k);
+        let over = self.s.m.cmp(c, pred::OGE, r, limit);
         self.s.m.select(c, over, k, r)
     }
 
@@ -4026,7 +4030,7 @@ impl<'a> Lower<'a> {
                 };
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
-                    22 => self.fract(a, f32::from_bits(0x3F7F_FFFF)),
+                    22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
                     _ => self.unary(op, a),
                 };
                 float(self, r)
@@ -4619,8 +4623,8 @@ impl<'a> Lower<'a> {
                     };
                     match op {
                         12 | 13 => self.trig_turns(a, op == 12),
-                        // 0x3bff as a half: 1 - 2^-11.
-                        22 => self.fract(a, 1.0 - 1.0 / 2048.0),
+                        // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
+                        22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
                         _ => self.unary(op, a),
                     }
                 }
@@ -6739,7 +6743,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(LOOP_LIMIT);
+        let limit = self.s.m.i32(super::loop_limit());
         self.counters
             .get_mut(&to)
             .expect("header")
