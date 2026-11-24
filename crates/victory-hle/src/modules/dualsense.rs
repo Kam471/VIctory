@@ -359,4 +359,24 @@ mod tests {
         assert!(parse(&[0x01, 0, 0]).is_none());
         assert!(parse(&[0x02; 64]).is_none());
     }
+
+    /// Not part of the suite: prints what the HID scan sees on this machine.
+    /// `cargo test -p victory-hle --lib dualsense -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn lists_and_opens_hid_devices() {
+        let paths = device_paths();
+        println!("hid interfaces: {}", paths.len());
+        for path in &paths {
+            println!("  {}", String::from_utf16_lossy(path));
+        }
+        match open_pad() {
+            Some((handle, len)) => {
+                println!("opened a DualSense: report length {len}");
+                // SAFETY: the handle is ours.
+                unsafe { CloseHandle(handle) };
+            }
+            None => println!("no DualSense opened"),
+        }
+    }
 }

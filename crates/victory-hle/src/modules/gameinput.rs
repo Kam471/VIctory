@@ -63,11 +63,12 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
     (0x08, B),    // Backspace
+    (b'O', B),    // Circle, for PlayStation players
     (b'X', X),
     (b'Y', Y),
     (0x26, UP), // arrows

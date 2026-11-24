@@ -7,15 +7,19 @@
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, BeginPaint, CreateFontW, DeleteObject, EndPaint, FONT_CHARSET, FONT_CLIP_PRECISION,
-    FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HBRUSH, InvalidateRect,
-    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TextOutW, UpdateWindow, TRANSPARENT,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, ClientToScreen,
+    CreateCompatibleDC,
+    CreateDIBSection, CreateFontW, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DeleteDC, DeleteObject, DrawTextW, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
+    FONT_QUALITY, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
@@ -1342,15 +1346,17 @@ struct Meter {
 /// The FPS overlay's own window: a small always-on-top, click-through HUD
 /// over the title, so the rate is visible in fullscreen too.
 static OVERLAY_GAME: AtomicIsize = AtomicIsize::new(0);
-static OVERLAY_TEXT: Mutex<Option<String>> = Mutex::new(None);
+static OVERLAY_TEXT: Mutex<Option<(String, String)>> = Mutex::new(None);
 
-/// Shows `text` in the overlay over `game`; `VICTORY_FPS_OVERLAY=0` turns it off.
-fn fps_overlay(game: HWND, text: &str) {
+/// Shows the rate and the frame's details in the overlay over `game`;
+/// `VICTORY_FPS_OVERLAY=0` turns it off.
+fn fps_overlay(game: HWND, fps: &str, detail: &str) {
     if std::env::var_os("VICTORY_FPS_OVERLAY").is_some_and(|v| v == "0") {
         return;
     }
     OVERLAY_GAME.store(game.0 as isize, Ordering::Relaxed);
-    *OVERLAY_TEXT.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+    *OVERLAY_TEXT.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((fps.to_string(), detail.to_string()));
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new()
@@ -1364,10 +1370,8 @@ fn overlay_thread() {
         let instance = GetModuleHandleW(None).unwrap_or_default();
         let class = w!("VictoryFpsOverlay");
         let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(overlay_proc),
             hInstance: HINSTANCE(instance.0),
-            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             lpszClassName: class,
             ..Default::default()
         };
@@ -1380,8 +1384,8 @@ fn overlay_thread() {
             WS_POPUP,
             0,
             0,
-            260,
-            34,
+            10,
+            10,
             None,
             None,
             Some(HINSTANCE(instance.0)),
@@ -1390,77 +1394,180 @@ fn overlay_thread() {
             Ok(hwnd) => hwnd,
             Err(_) => return,
         };
-        // Black is the transparent colour: the brush paints the window's
-        // background and the green text stays.
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_COLORKEY);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         tracing::info!("FPS overlay shown");
         loop {
-            let game = OVERLAY_GAME.load(Ordering::Relaxed);
-            if game != 0 {
-                let mut rect = RECT::default();
-                if GetWindowRect(HWND(game as *mut _), &mut rect).is_ok() {
-                    let _ = SetWindowPos(
-                        hwnd,
-                        Some(HWND_TOPMOST),
-                        rect.left + 12,
-                        rect.top + 40,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    );
-                }
-            }
-            let _ = InvalidateRect(Some(hwnd), None, true);
-            let _ = UpdateWindow(hwnd);
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-    }
-}
-
-extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-        WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            let text = OVERLAY_TEXT
+            let (fps, detail) = OVERLAY_TEXT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
                 .unwrap_or_default();
-            let wide: Vec<u16> = text.encode_utf16().collect();
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x0000_ff00)); // 0x00BBGGRR: green
-            let font = CreateFontW(
-                -20,
-                0,
-                0,
-                0,
-                700,
-                0,
-                0,
-                0,
-                FONT_CHARSET(1),
-                FONT_OUTPUT_PRECISION(0),
-                FONT_CLIP_PRECISION(0),
-                FONT_QUALITY(4),
-                0,
-                w!("Segoe UI"),
-            );
-            let old = SelectObject(hdc, font.into());
-            let _ = TextOutW(hdc, 8, 6, &wide);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(font.into());
-            let _ = TextOutW(hdc, 8, 6, &wide);
-            SelectObject(hdc, old);
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
-        }
-        WM_ERASEBKGND => DefWindowProcW(hwnd, msg, w, l),
-        _ => DefWindowProcW(hwnd, msg, w, l),
+            let game = OVERLAY_GAME.load(Ordering::Relaxed);
+            if game != 0 && !fps.is_empty() {
+                let mut at = POINT::default();
+                if ClientToScreen(HWND(game as *mut _), &mut at).as_bool() {
+                    render_overlay(hwnd, &fps, &detail, at.x + 16, at.y + 12);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
+}
+
+/// Paints the HUD with per-pixel alpha: a bright rate, dimmer details and a
+/// one-pixel dark outline, so there is no box behind it.
+fn render_overlay(hwnd: HWND, fps: &str, detail: &str, x: i32, y: i32) {
+    unsafe {
+    const PAD: i32 = 2;
+    let fps_wide: Vec<u16> = fps.encode_utf16().collect();
+    let detail_wide: Vec<u16> = detail.encode_utf16().collect();
+    let dc = CreateCompatibleDC(None);
+    if dc.is_invalid() {
+        return;
+    }
+    let font = |height: i32, weight: i32| {
+        unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            FONT_CHARSET(1),
+            FONT_OUTPUT_PRECISION(0),
+            FONT_CLIP_PRECISION(0),
+            FONT_QUALITY(4),
+            0,
+            w!("Segoe UI"),
+        )
+        }
+    };
+    let fps_font = font(-20, 600);
+    let detail_font = font(-15, 500);
+    let old = SelectObject(dc, fps_font.into());
+    let mut fps_size = SIZE::default();
+    let _ = GetTextExtentPoint32W(dc, &fps_wide, &mut fps_size);
+    SelectObject(dc, detail_font.into());
+    let mut detail_size = SIZE::default();
+    let _ = GetTextExtentPoint32W(dc, &detail_wide, &mut detail_size);
+    SelectObject(dc, old);
+
+    let gap = 9;
+    let width = fps_size.cx + gap + detail_size.cx + PAD * 2;
+    let height = fps_size.cy.max(detail_size.cy) + PAD * 2;
+    let mut info = BITMAPINFO::default();
+    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = width;
+    // Top-down, so row zero is the top row.
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let bitmap = match CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(bitmap) => bitmap,
+        Err(_) => {
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(fps_font.into());
+            let _ = DeleteObject(detail_font.into());
+            return;
+        }
+    };
+    SelectObject(dc, bitmap.into());
+    SetBkMode(dc, TRANSPARENT);
+    let count = (width * height) as usize;
+
+    let paint = |dx: i32, dy: i32| {
+        unsafe {
+        SelectObject(dc, fps_font.into());
+        SetTextColor(dc, COLORREF(0x00ff_ffff));
+        let mut rect = RECT {
+            left: PAD + dx,
+            top: dy,
+            right: width,
+            bottom: height,
+        };
+        DrawTextW(
+            dc,
+            &mut fps_wide.clone(),
+            &mut rect,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT,
+        );
+        SelectObject(dc, detail_font.into());
+        SetTextColor(dc, COLORREF(0x00d0_d0d0));
+        let mut rect = RECT {
+            left: PAD + fps_size.cx + gap + dx,
+            top: dy,
+            right: width,
+            bottom: height,
+        };
+        DrawTextW(
+            dc,
+            &mut detail_wide.clone(),
+            &mut rect,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT,
+        );
+        }
+    };
+
+    paint(0, 0);
+    let text: Vec<u32> = std::slice::from_raw_parts(bits.cast::<u32>(), count).to_vec();
+    std::ptr::write_bytes(bits.cast::<u32>(), 0, count);
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        paint(dx, dy);
+    }
+    let outline: Vec<u32> = std::slice::from_raw_parts(bits.cast::<u32>(), count).to_vec();
+    let boundary = PAD + fps_size.cx + gap - 2;
+    let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), count);
+    for row in 0..height {
+        for column in 0..width {
+            let i = (row * width + column) as usize;
+            let t = text[i] & 0xff;
+            let o = outline[i] & 0xff;
+            let alpha = t.max(o);
+            pixels[i] = if alpha == 0 {
+                0
+            } else if t >= o {
+                // Premultiplied: the detail text is a dim grey, the rate white.
+                let level = if column < boundary { alpha } else { alpha * 200 / 255 };
+                (alpha << 24) | (level << 16) | (level << 8) | level
+            } else {
+                // The outline is black at three-quarters strength.
+                (alpha * 3 / 4) << 24
+            };
+        }
+    }
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let _ = UpdateLayeredWindow(
+        hwnd,
+        None,
+        Some(&POINT { x, y }),
+        Some(&SIZE {
+            cx: width,
+            cy: height,
+        }),
+        Some(dc),
+        Some(&POINT::default()),
+        COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
+    let _ = DeleteObject(bitmap.into());
+    let _ = DeleteObject(fps_font.into());
+    let _ = DeleteObject(detail_font.into());
+    let _ = DeleteDC(dc);
+    }
+}
+
+extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 
 impl Meter {
@@ -1489,12 +1596,10 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        let (cache_hits, cache_misses) = crate::shader_cache::counts();
         fps_overlay(
             hwnd,
-            &format!(
-                "VIctory  {fps:.1} FPS  {ms:.1} ms  {draws:.0} draws  shaders {cache_hits}h/{cache_misses}m"
-            ),
+            &format!("{fps:.0} FPS"),
+            &format!("{ms:.1} ms  ·  {draws:.0} draws"),
         );
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
