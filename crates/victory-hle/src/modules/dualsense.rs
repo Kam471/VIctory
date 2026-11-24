@@ -2,8 +2,12 @@
 //!
 //! The console reports gamepads through GameInput; on a PC a DualSense is not
 //! an XInput device, so the title never sees it. This reads the pad's HID
-//! input reports and exposes the same state shape the XInput source does.
-//! Both transports are parsed: USB report 0x01 and Bluetooth report 0x31.
+//! reports and exposes the same state shape the XInput source does.
+//!
+//! The reports differ between USB (64 bytes) and Bluetooth (78 bytes, and a
+//! different offset for the buttons and triggers), so fields are read through
+//! Windows' HID parser (`HidP_*`) by their declared usages rather than by
+//! fixed offsets. Both transports and the Edge's report then read the same.
 //!
 //! shortcut: touchpad, gyro and the lightbar are not reported (the title's
 //! pad surface has no axes for them); rumble is not sent back yet.
@@ -19,8 +23,11 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData,
-    HidD_GetAttributes, HidD_GetPreparsedData, HidP_GetCaps,
+    GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS,
+    HID_USAGE_GENERIC_HATSWITCH, HID_USAGE_GENERIC_RX, HID_USAGE_GENERIC_RY, HID_USAGE_GENERIC_RZ,
+    HID_USAGE_GENERIC_X, HID_USAGE_GENERIC_Y, HID_USAGE_GENERIC_Z, HID_USAGE_PAGE_BUTTON,
+    HID_USAGE_PAGE_GENERIC, HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetPreparsedData,
+    HidP_GetCaps, HidP_GetUsageValue, HidP_GetUsages, HidP_Input,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -75,12 +82,28 @@ pub fn latest() -> Option<Reading> {
     *READING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// An open pad: its input handle, the HID parser's description of it (freed
+/// on drop) and the input report length.
+struct Pad {
+    handle: HANDLE,
+    preparsed: isize,
+    input_len: usize,
+}
+
+impl Drop for Pad {
+    fn drop(&mut self) {
+        // SAFETY: both came from the HID API for this handle.
+        unsafe {
+            HidD_FreePreparsedData(self.preparsed);
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 fn reader() {
     loop {
-        if let Some((handle, input_len)) = open_pad() {
-            read_reports(handle, input_len);
-            // SAFETY: our own handle.
-            unsafe { CloseHandle(handle) };
+        if let Some(pad) = open_pad() {
+            read_reports(&pad);
         }
         *READING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // A pad that is off or out of range is looked for again.
@@ -89,14 +112,16 @@ fn reader() {
 }
 
 /// Reads until the pad goes away. A report that does not parse is ignored.
-fn read_reports(handle: HANDLE, input_len: usize) {
-    let mut buf = vec![0u8; input_len.max(78)];
+fn read_reports(pad: &Pad) {
+    let mut buf = vec![0u8; pad.input_len.max(78)];
+    let log = std::env::var_os("VICTORY_PAD_LOG").is_some();
+    let mut last: Option<Reading> = None;
     loop {
         let mut read = 0u32;
         // SAFETY: a live handle and a buffer of its report length.
         let ok = unsafe {
             ReadFile(
-                handle,
+                pad.handle,
                 buf.as_mut_ptr().cast(),
                 buf.len() as u32,
                 &mut read,
@@ -106,14 +131,37 @@ fn read_reports(handle: HANDLE, input_len: usize) {
         if ok == 0 || read == 0 {
             return;
         }
-        if let Some(reading) = parse(&buf[..read as usize]) {
-            *READING.lock().unwrap_or_else(|e| e.into_inner()) = Some(reading);
+        let Some(reading) = parse(pad.preparsed, &buf[..read as usize]) else {
+            continue;
+        };
+        if last == Some(reading) {
+            continue;
         }
+        if log {
+            tracing::info!(
+                buttons = format_args!("{:#x}", reading.buttons),
+                left = format_args!(
+                    "{:.2},{:.2}",
+                    reading.left_x, reading.left_y
+                ),
+                right = format_args!(
+                    "{:.2},{:.2}",
+                    reading.right_x, reading.right_y
+                ),
+                triggers = format_args!(
+                    "{:.2},{:.2}",
+                    reading.left_trigger, reading.right_trigger
+                ),
+                "DualSense report"
+            );
+        }
+        last = Some(reading);
+        *READING.lock().unwrap_or_else(|e| e.into_inner()) = Some(reading);
     }
 }
 
-/// Opens the first DualSense and returns it with its input report length.
-fn open_pad() -> Option<(HANDLE, usize)> {
+/// Opens the first DualSense and keeps its HID description.
+fn open_pad() -> Option<Pad> {
     for path in device_paths() {
         let handle = unsafe {
             CreateFileW(
@@ -137,34 +185,34 @@ fn open_pad() -> Option<(HANDLE, usize)> {
             && attributes.VendorID == SONY
             && (attributes.ProductID == DUALSENSE || attributes.ProductID == DUALSENSE_EDGE)
         {
+            let mut preparsed: isize = 0;
+            // SAFETY: a live HID handle and room for the pointer.
+            if !unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } {
+                unsafe { CloseHandle(handle) };
+                continue;
+            }
+            let mut caps: HIDP_CAPS = unsafe { std::mem::zeroed() };
+            // SAFETY: the preparations are ours until freed.
+            let status = unsafe { HidP_GetCaps(preparsed, &mut caps) };
+            let input_len = if status == HIDP_STATUS_SUCCESS {
+                usize::from(caps.InputReportByteLength).max(1)
+            } else {
+                78
+            };
             tracing::info!(
                 product = format_args!("{:#06x}", attributes.ProductID),
+                report = input_len,
                 "DualSense connected over HID"
             );
-            let input_len = report_length(handle);
-            return Some((handle, input_len));
+            return Some(Pad {
+                handle,
+                preparsed,
+                input_len,
+            });
         }
         unsafe { CloseHandle(handle) };
     }
     None
-}
-
-/// The input report length the HID stack reports, or the DualSense's 78.
-fn report_length(handle: HANDLE) -> usize {
-    let mut preparsed: isize = 0;
-    // SAFETY: a live HID handle and room for the pointer.
-    if !unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } {
-        return 78;
-    }
-    let mut caps: HIDP_CAPS = unsafe { std::mem::zeroed() };
-    // SAFETY: the preparations are ours until freed.
-    let status = unsafe { HidP_GetCaps(preparsed, &mut caps) };
-    unsafe { HidD_FreePreparsedData(preparsed) };
-    if status == HIDP_STATUS_SUCCESS {
-        usize::from(caps.InputReportByteLength).max(1)
-    } else {
-        78
-    }
 }
 
 /// Every present HID interface's device path.
@@ -240,26 +288,92 @@ fn device_paths() -> Vec<Vec<u16>> {
     paths
 }
 
-/// The pad state in a DualSense input report, if this one is one.
-fn parse(report: &[u8]) -> Option<Reading> {
-    // USB report 0x01 carries the state from byte 1; Bluetooth report 0x31 has
-    // a sequence byte at 1 and the same state from byte 2.
-    let base = match report.first()? {
-        0x01 => 0,
-        0x31 => 1,
-        _ => return None,
+/// A declared usage's value in `report`, if the descriptor has it.
+fn usage_value(preparsed: isize, report: &[u8], usage: u16) -> Option<u32> {
+    let mut value = 0u32;
+    // SAFETY: the report and the parser's description are live.
+    let status = unsafe {
+        HidP_GetUsageValue(
+            HidP_Input,
+            HID_USAGE_PAGE_GENERIC,
+            0,
+            usage,
+            &mut value,
+            preparsed,
+            report.as_ptr(),
+            report.len() as u32,
+        )
     };
-    if report.len() < base + 10 {
+    (status == HIDP_STATUS_SUCCESS).then_some(value)
+}
+
+/// The buttons held in `report`, as HID usage numbers 1 to 14.
+fn usage_buttons(preparsed: isize, report: &[u8]) -> Vec<u16> {
+    let mut usages = [0u16; 32];
+    let mut len = usages.len() as u32;
+    // SAFETY: the report and the parser's description are live; the API only
+    // reads the report.
+    let status = unsafe {
+        HidP_GetUsages(
+            HidP_Input,
+            HID_USAGE_PAGE_BUTTON,
+            0,
+            usages.as_mut_ptr(),
+            &mut len,
+            preparsed,
+            report.as_ptr() as *mut u8,
+            report.len() as u32,
+        )
+    };
+    if status == HIDP_STATUS_SUCCESS {
+        usages[..len as usize].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The pad state from the report's declared fields.
+///
+/// Button usages, in Sony's order: 1 square, 2 cross, 3 circle, 4 triangle,
+/// 5 L1, 6 R1, 7 L2, 8 R2, 9 create, 10 options, 11 L3, 12 R3, 13 PS,
+/// 14 touchpad. Square, cross, circle and triangle become the title's X, A,
+/// B and Y, so circle is back as on the console.
+fn parse(preparsed: isize, report: &[u8]) -> Option<Reading> {
+    if report.len() < 2 || report[0] != 0x01 {
         return None;
     }
-    let axis = |i: usize| f32::from(report[base + i]);
-    let centered = |v: f32| ((v - 127.5) / 127.5).clamp(-1.0, 1.0);
-    let buttons0 = report[base + 7];
-    let buttons1 = report[base + 8];
-    let buttons2 = report[base + 9];
+    let axis = |usage| usage_value(preparsed, report, usage).unwrap_or(128);
+    let trigger = |usage| usage_value(preparsed, report, usage).unwrap_or(0);
+    Some(state(
+        [axis(HID_USAGE_GENERIC_X), axis(HID_USAGE_GENERIC_Y), axis(HID_USAGE_GENERIC_Z), axis(HID_USAGE_GENERIC_RZ)],
+        [trigger(HID_USAGE_GENERIC_RX), trigger(HID_USAGE_GENERIC_RY)],
+        usage_value(preparsed, report, HID_USAGE_GENERIC_HATSWITCH).unwrap_or(8),
+        &usage_buttons(preparsed, report),
+    ))
+}
+
+/// Turns the declared fields into the title's pad state.
+fn state(sticks: [u32; 4], triggers: [u32; 2], hat: u32, usages: &[u16]) -> Reading {
+    let centered = |v: u32| ((f32::from(v as u8) - 127.5) / 127.5).clamp(-1.0, 1.0);
     let mut buttons = 0u32;
-    // The low nibble is the hat: 0 up, clockwise, 8 none.
-    buttons |= match buttons0 & 0x0f {
+    for usage in usages {
+        buttons |= match usage {
+            1 => X,              // square
+            2 => A,              // cross
+            3 => B,              // circle
+            4 => Y,              // triangle
+            5 => LEFT_SHOULDER,  // L1
+            6 => RIGHT_SHOULDER, // R1
+            9 => VIEW,           // create
+            10 => MENU,          // options
+            11 => LEFT_STICK,
+            12 => RIGHT_STICK,
+            13 => MENU, // PS
+            _ => 0,
+        };
+    }
+    // 0 is up and the directions run clockwise; 8 is released.
+    buttons |= match hat {
         0 => UP,
         1 => UP | RIGHT,
         2 => RIGHT,
@@ -270,94 +384,72 @@ fn parse(report: &[u8]) -> Option<Reading> {
         7 => UP | LEFT,
         _ => 0,
     };
-    // The high nibble: square, cross, circle, triangle.
-    if buttons0 & 0x10 != 0 {
-        buttons |= X;
-    }
-    if buttons0 & 0x20 != 0 {
-        buttons |= A;
-    }
-    if buttons0 & 0x40 != 0 {
-        buttons |= B;
-    }
-    if buttons0 & 0x80 != 0 {
-        buttons |= Y;
-    }
-    if buttons1 & 0x01 != 0 {
-        buttons |= LEFT_SHOULDER;
-    }
-    if buttons1 & 0x02 != 0 {
-        buttons |= RIGHT_SHOULDER;
-    }
-    if buttons1 & 0x10 != 0 {
-        buttons |= VIEW; // create
-    }
-    if buttons1 & 0x20 != 0 {
-        buttons |= MENU; // options
-    }
-    if buttons1 & 0x40 != 0 {
-        buttons |= LEFT_STICK;
-    }
-    if buttons1 & 0x80 != 0 {
-        buttons |= RIGHT_STICK;
-    }
-    if buttons2 & 0x01 != 0 {
-        buttons |= MENU; // PS
-    }
-    Some(Reading {
+    Reading {
         buttons,
-        left_trigger: axis(5) / 255.0,
-        right_trigger: axis(6) / 255.0,
-        left_x: centered(axis(1)),
-        // The pad's Y axis grows downwards; the title's sticks grow upwards.
-        left_y: -centered(axis(2)),
-        right_x: centered(axis(3)),
-        right_y: -centered(axis(4)),
-    })
+        left_trigger: f32::from(triggers[0] as u8) / 255.0,
+        right_trigger: f32::from(triggers[1] as u8) / 255.0,
+        left_x: centered(sticks[0]),
+        // The pad's Y axes grow downwards; the title's sticks grow upwards.
+        left_y: -centered(sticks[1]),
+        right_x: centered(sticks[2]),
+        right_y: -centered(sticks[3]),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn usb_report_maps_buttons_and_axes() {
-        let mut report = [0u8; 64];
-        report[0] = 0x01;
-        report[1] = 255; // left stick right
-        report[2] = 0; // left stick up
-        report[3] = 128;
-        report[4] = 128;
-        report[5] = 255; // left trigger
-        report[7] = 0x20 | 0x2; // cross, hat right
-        report[8] = 0x01 | 0x20; // L1, options
-        let r = parse(&report).expect("a USB report");
-        assert_eq!(r.buttons, A | RIGHT | LEFT_SHOULDER | MENU);
-        assert_eq!(r.left_trigger, 1.0);
-        assert_eq!(r.left_x, 1.0);
-        assert_eq!(r.left_y, 1.0);
+    const CENTER: [u32; 4] = [128, 128, 128, 128];
+    const UP_NEUTRAL: u32 = 8;
+
+    fn pad(usages: &[u16], hat: u32) -> Reading {
+        state(CENTER, [0, 0], hat, usages)
     }
 
     #[test]
-    fn bluetooth_report_has_one_extra_byte() {
-        let mut report = [0u8; 78];
-        report[0] = 0x31;
-        report[1] = 7; // sequence
-        report[2] = 0; // left stick left
-        report[3] = 255; // left stick down
-        report[7] = 0xff; // right trigger
-        report[8] = 0x08; // cross? no: bit 3 is square? high nibble is byte & 0xf0
-        report[9] = 0;
-        let r = parse(&report).expect("a Bluetooth report");
-        assert_eq!(r.left_x, -1.0);
-        assert_eq!(r.left_y, -1.0);
-        assert_eq!(r.right_trigger, 1.0);
+    fn cross_circle_square_and_triangle_map() {
+        assert_eq!(pad(&[2], UP_NEUTRAL).buttons, A);
+        assert_eq!(pad(&[3], UP_NEUTRAL).buttons, B);
+        assert_eq!(pad(&[1], UP_NEUTRAL).buttons, X);
+        assert_eq!(pad(&[4], UP_NEUTRAL).buttons, Y);
     }
 
     #[test]
-    fn a_short_or_foreign_report_is_ignored() {
-        assert!(parse(&[0x01, 0, 0]).is_none());
-        assert!(parse(&[0x02; 64]).is_none());
+    fn shoulders_system_and_stick_clicks_map() {
+        assert_eq!(
+            pad(&[5, 6, 9, 10, 11, 12, 13], UP_NEUTRAL).buttons,
+            LEFT_SHOULDER | RIGHT_SHOULDER | VIEW | MENU | LEFT_STICK | RIGHT_STICK
+        );
+    }
+
+    #[test]
+    fn hat_directions_run_clockwise_from_up() {
+        assert_eq!(pad(&[], 0).buttons, UP);
+        assert_eq!(pad(&[], 1).buttons, UP | RIGHT);
+        assert_eq!(pad(&[], 2).buttons, RIGHT);
+        assert_eq!(pad(&[], 3).buttons, DOWN | RIGHT);
+        assert_eq!(pad(&[], 4).buttons, DOWN);
+        assert_eq!(pad(&[], 5).buttons, DOWN | LEFT);
+        assert_eq!(pad(&[], 6).buttons, LEFT);
+        assert_eq!(pad(&[], 7).buttons, UP | LEFT);
+        assert_eq!(pad(&[], 8).buttons, 0);
+    }
+
+    #[test]
+    fn sticks_are_centered_and_signed() {
+        let r = state(CENTER, [0, 0], UP_NEUTRAL, &[]);
+        assert!(r.left_x.abs() < 0.01 && r.left_y.abs() < 0.01);
+        assert!(r.right_x.abs() < 0.01 && r.right_y.abs() < 0.01);
+        let r = state([255, 0, 0, 255], [0, 0], UP_NEUTRAL, &[]);
+        assert_eq!((r.left_x, r.left_y), (1.0, 1.0));
+        assert_eq!((r.right_x, r.right_y), (-1.0, -1.0));
+    }
+
+    #[test]
+    fn triggers_run_zero_to_one() {
+        let r = state(CENTER, [255, 0], UP_NEUTRAL, &[]);
+        assert_eq!((r.left_trigger, r.right_trigger), (1.0, 0.0));
     }
 
     /// Not part of the suite: prints what the HID scan sees on this machine.
@@ -371,11 +463,7 @@ mod tests {
             println!("  {}", String::from_utf16_lossy(path));
         }
         match open_pad() {
-            Some((handle, len)) => {
-                println!("opened a DualSense: report length {len}");
-                // SAFETY: the handle is ours.
-                unsafe { CloseHandle(handle) };
-            }
+            Some(pad) => println!("opened a DualSense: report length {}", pad.input_len),
             None => println!("no DualSense opened"),
         }
     }
