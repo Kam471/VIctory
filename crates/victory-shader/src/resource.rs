@@ -1072,16 +1072,14 @@ impl<'a> Tracer<'a> {
         if s.base.is_none()
             && let Some(v) = s.dynamic
             && let Some(reg) = self.inputs[v.0 as usize]
-            && self
-                .param_of(reg)
-                .is_some_and(|(p, _)| self.layout[p].root == RootType::Constants)
+            && self.param_of(reg).is_some_and(|(p, dword)| {
+                dword > 0 && self.layout[p].root == RootType::Constants
+            })
         {
             s.base = Some(v);
             s.dynamic = None;
         }
-        if s.dynamic.is_some() && extra.dynamic.is_some() {
-            return Err("an address with two computed terms");
-        }
+        // Two computed terms are one relative offset (see `rel` below).
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         let use_rel = s.multi || (s.dynamic.is_some() && extra.dynamic.is_some());
         let lo_val = match lo {

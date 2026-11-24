@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use victory_shader::emit::RootView;
+use victory_shader::emit::RootView as ViewRegister;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -1059,7 +1059,7 @@ impl State {
     /// The address the root view at `register` reads ([`RootView`]): a root
     /// view the title set, or an address it passes in two root constants.
     fn view_address(&self, compute: bool, register: u16) -> Option<u64> {
-        let view = RootView::of(register);
+        let view = ViewRegister::of(register);
         match (
             self.roots_ref(compute).get(usize::from(view.slot))?,
             view.dword,
@@ -2250,7 +2250,7 @@ mod root_view_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod view_register_tests {
     use super::*;
 
     #[test]
@@ -2258,7 +2258,7 @@ mod tests {
         let mut s = State::default();
         s.set_view(true, 1, 0x1234_5678_9000);
         s.set_constants(true, 3, &[7, 0x9abc_0000, 0x12, 9], 0);
-        let at = |slot, dword| RootView { slot, dword }.register();
+        let at = |slot, dword| ViewRegister { slot, dword }.register();
         assert_eq!(s.view_address(true, at(1, None)), Some(0x1234_5678_9000));
         // An address in root constants 1 and 2 of parameter 3 (#614).
         assert_eq!(s.view_address(true, at(3, Some(1))), Some(0x12_9abc_0000));

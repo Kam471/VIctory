@@ -35,7 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u16>,
     pub root_srvs: Vec<u16>,
-    pub root_uavs: Vec<u16>,
+    pub root_uavs: Vec<u8>,
 
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
@@ -9445,6 +9445,7 @@ mod tests {
                     static_samplers: Vec::new(),
                     root_cbvs: l.root_cbvs,
                     root_srvs: l.root_srvs,
+                    root_uavs: l.root_uavs,
                 };
                 host.compute_pipeline(&cs).unwrap();
             }

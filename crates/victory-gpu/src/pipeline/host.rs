@@ -366,7 +366,7 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
+        let mut root_views: Vec<((i32, u16), u32)> = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -391,6 +391,7 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
+            let root_uavs_u16: Vec<u16> = t.root_uavs.iter().map(|&s| u16::from(s)).collect();
             for (slots, kind, out) in [
                 (
                     &t.root_cbvs,
@@ -403,7 +404,7 @@ impl HostPipeline {
                     &mut stage.root_srvs,
                 ),
                 (
-                    &t.root_uavs,
+                    &root_uavs_u16,
                     D3D12_ROOT_PARAMETER_TYPE_UAV,
                     &mut stage.root_uavs,
                 ),
@@ -698,9 +699,9 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
 /// root descriptors do not consume extra root signature dwords.
 fn push_root_view(
     params: &mut Vec<D3D12_ROOT_PARAMETER1>,
-    seen: &mut Vec<((i32, u8), u32)>,
+    seen: &mut Vec<((i32, u16), u32)>,
     kind: D3D12_ROOT_PARAMETER_TYPE,
-    slot: u8,
+    slot: u16,
     visibility: D3D12_SHADER_VISIBILITY,
 ) -> u32 {
     if let Some(&(_, existing)) = seen.iter().find(|&&(k, _)| k == (kind.0, slot)) {

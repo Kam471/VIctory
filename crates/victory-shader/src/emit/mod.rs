@@ -221,7 +221,6 @@ impl RootView {
             dword: (register >> 8).checked_sub(1).map(|d| d as u8),
         }
     }
->>>>>>> 995f7f3 (Shaders: an address in two root constants is a root view (#614))
 }
 
 impl HostShader {
