@@ -1997,3 +1997,130 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// DS `op` at offsets 0: `addr` in bits 0-7, `data0` in 8-15, `vdst` in 24-31.
+const fn ds_op(op: u32, addr: u8, data0: u8, vdst: u8) -> [u32; 2] {
+    [
+        0xD800_0000 | op << 18,
+        addr as u32 | (data0 as u32) << 8 | (vdst as u32) << 24,
+    ]
+}
+
+/// [`valu_program`] with 512 bytes of LDS, so `ds_*` instructions can run.
+fn valu_program_lds(body: &[u32]) -> NativeProgram {
+    let mut native = valu_program(body);
+    let StageIo::Cs(cs) = &mut native.io else {
+        unreachable!()
+    };
+    cs.rsrc2 |= 1 << 15;
+    cs.threads = [64, 1, 1];
+    native
+}
+
+/// Lowers `body` from [`valu_program_lds`] into a host shader.
+fn lower_lds(body: &[u32]) -> HostShader {
+    let native = valu_program_lds(body);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        psv: None,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        options: Default::default(),
+        host_waves: None,
+    })
+    .expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+    HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        stride_table: lowered.stride_table,
+    }
+}
+
+#[test]
+fn lds_byte_and_half_writes_round_trip() {
+    // v1 = s0 (value), v2 = s1 (byte address). Write a half, read it back
+    // unsigned; write a byte, read it back signed.
+    let half = [
+        ds_op(0x01f, 2, 1, 0), // ds_write_b16 [v2], v1
+        ds_op(0x03c, 2, 0, 0), // v0 = ds_read_u16 [v2]
+    ]
+    .concat();
+    let signed = [
+        ds_op(0x01e, 2, 1, 0), // ds_write_b8 [v2], v1
+        ds_op(0x039, 2, 0, 0), // v0 = ds_read_i8 [v2]
+    ]
+    .concat();
+    let cases = [[0x1234_abcd, 0, 0, 0], [0xffff_ffff, 4, 0, 0]];
+    for (body, expect) in [
+        (half, [0x0000_abcd_u32, 0x0000_ffff]),
+        (signed, [0xffff_ffcd, 0xffff_ffff]),
+    ] {
+        let shader = lower_lds(&body);
+        run_cases(&shader, &cases, |device, i, _, out| {
+            assert_eq!(out, expect[i], "{device}: case {i}");
+        });
+    }
+}
+
+#[test]
+fn lds_d16_reads_keep_the_other_half() {
+    // v0 = all ones, then a d16 read keeps its high half and writes the low;
+    // a d16_hi read keeps the low half and writes the high.
+    let mut low = vec![
+        vop1(0x001, 0, 0x80),    // v0 = 0
+        vop1(0x037, 0, vgpr(0)), // v0 = ~v0
+    ];
+    low.extend_from_slice(&ds_op(0x00d, 2, 1, 0)); // ds_write_b32 [v2], v1
+    low.extend_from_slice(&ds_op(0x0a6, 2, 0, 0)); // v0 = ds_read_u16_d16 [v2]
+    let mut high = vec![vop1(0x001, 0, 0x80)]; // v0 = 0
+    high.extend_from_slice(&ds_op(0x00d, 2, 1, 0)); // ds_write_b32 [v2], v1
+    high.extend_from_slice(&ds_op(0x0a7, 2, 0, 0)); // v0 = ds_read_u16_d16_hi [v2]
+    let cases = [[0x1234_5678, 0, 0, 0], [0x0000_ffff, 8, 0, 0]];
+    for (body, expect) in [
+        (low, [0xffff_5678_u32, 0xffff_ffff]),
+        (high, [0x5678_0000, 0xffff_0000]),
+    ] {
+        let shader = lower_lds(&body);
+        run_cases(&shader, &cases, |device, i, _, out| {
+            assert_eq!(out, expect[i], "{device}: case {i}");
+        });
+    }
+}
+
+#[test]
+fn lds_narrow_opcodes_all_translate() {
+    // Every byte/half read and write form names an LDS operation; the write
+    // forms come in plain and d16_hi variants only.
+    let mut body = Vec::new();
+    for op in [0x01e, 0x01f, 0x0a0, 0x0a1] {
+        body.extend_from_slice(&ds_op(op, 2, 1, 0));
+    }
+    for op in [
+        0x039, 0x03a, 0x03b, 0x03c, 0x0a2, 0x0a3, 0x0a4, 0x0a5, 0x0a6, 0x0a7,
+    ] {
+        body.extend_from_slice(&ds_op(op, 2, 0, 0));
+    }
+    lower_lds(&body);
+}
