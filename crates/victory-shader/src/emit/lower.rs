@@ -9001,6 +9001,28 @@ mod tests {
         wave64: bool,
         const_sgprs: u8,
     ) -> Result<super::Lowered, crate::ShaderError> {
+        lowers_full(
+            words,
+            wave64,
+            const_sgprs,
+            u32::from(const_sgprs) << 1,
+            if wave64 { 64 } else { 32 },
+        )
+    }
+
+    /// Lowers with an explicit dispatch input encoding (`rsrc2`), for tests
+    /// that read group IDs.
+    fn lowers_rsrc2(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_full(words, false, 0, rsrc2, 1).map(|_| ())
+    }
+
+    fn lowers_full(
+        words: &[u32],
+        wave64: bool,
+        const_sgprs: u8,
+        rsrc2: u32,
+        threads_x: u32,
+    ) -> Result<super::Lowered, crate::ShaderError> {
         use crate::native::{RootParam, RootType};
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let layout = if const_sgprs > 0 {
@@ -9022,8 +9044,8 @@ mod tests {
             layout,
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: u32::from(const_sgprs) << 1,
-                threads: [if wave64 { 64 } else { 32 }, 1, 1],
+                rsrc2,
+                threads: [threads_x, 1, 1],
             }),
             code,
         };
@@ -9248,6 +9270,35 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    #[test]
+    fn a_missing_value_stays_missing_through_two_live_joins() {
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the first overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+            0xBF85_0001, // skip the second overwrite
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // use the result to branch
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        // Compare to a direct read so future timestamp support works in both cases.
+        let refusal = |code: &[u32]| match lowers_rsrc2(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[8..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
+        lowers_rsrc2(&words, group_ids_xy).expect("dead timestamp");
     }
 
     #[test]
