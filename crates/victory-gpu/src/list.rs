@@ -1199,7 +1199,7 @@ extern "system" fn execute_indirect(
             if ran {
                 // Indirect records are the same work a direct call records:
                 // charge them so a mesh record cannot hide from the split.
-                let weight = match kind {
+                let weight: u32 = match kind {
                     10 => 64,
                     2 => 2,
                     _ => 1,
