@@ -29,9 +29,46 @@ pub(crate) fn listed(n: u64) -> bool {
     .contains(&n)
 }
 
-/// Whether frame `n` is saved.
+/// Whether frame `n` is saved: a power of two, one listed in
+/// `VICTORY_CAPTURE_FRAMES`, or the first frame at or after a time in
+/// `VICTORY_CAPTURE_AT_SECONDS` (the world presents a few frames a minute,
+/// so a frame number is hard to aim at).
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && (n.is_power_of_two() || listed(n) || due(n))
+}
+
+/// The first frame at or after each second in `VICTORY_CAPTURE_AT_SECONDS`
+/// (comma-separated, since process start): true once per time. Memoized per
+/// frame so the capture and the target dump of one frame agree.
+pub(crate) fn due(n: u64) -> bool {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static TIMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    static FIRED: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+        std::sync::Mutex::new(None);
+    static LAST: std::sync::Mutex<Option<(u64, bool)>> = std::sync::Mutex::new(None);
+    let times = TIMES.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_AT_SECONDS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|f| f.trim().parse().ok())
+            .collect()
+    });
+    if times.is_empty() {
+        return false;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((frame, due)) = *last {
+        if frame == n {
+            return due;
+        }
+    }
+    let start = START.get_or_init(std::time::Instant::now);
+    let now = start.elapsed().as_secs();
+    let mut fired = FIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let fired = fired.get_or_insert_with(Default::default);
+    let due = times.iter().any(|&at| now >= at && fired.insert(at));
+    *last = Some((n, due));
+    due
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -213,9 +250,26 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// Whether a time-based capture is configured (`VICTORY_CAPTURE_AT_SECONDS`):
+/// render targets are then noted for every frame, so the one picked is
+/// complete.
+pub(crate) fn timed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CAPTURE_AT_SECONDS").is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// Drops the targets noted for a frame that was not dumped.
+pub(crate) fn forget_targets() {
+    if timed() {
+        TARGETS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() || !(listed(crate::queue::presented() + 1) || timed()) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
