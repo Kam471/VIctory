@@ -52,8 +52,12 @@
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. 64-bit atomics
+//!   (added 2026-11-24) need an `R32G32_UINT` view there, as the title's,
+//!   and a device with 64-bit typed atomics on descriptor heap resources
+//!   (`AtomicInt64OnTypedResourceSupported`,
+//!   `AtomicInt64OnDescriptorHeapResourceSupported`); without them the host
+//!   refuses the pipeline. Global loads from a root SRV read it raw.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -671,5 +675,111 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// A compute program with one image atomic on a texture from a
+    /// descriptor table in s0, as emitted DXIL.
+    fn image_atomic(atomic: [u32; 2], data: &[u32]) -> Result<HostShader, ShaderError> {
+        let mut words = vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+        ];
+        words.extend(data);
+        words.extend(atomic);
+        words.push(0xBF81_0000); // s_endpgm
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            // One user SGPR, thread ids in v0 and v1.
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1 | 1 << 11,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        let container = crate::dxbc::build(&[]);
+        emit(&Container::parse(&container)?, &native, &p, &st, &io, &res)
+    }
+
+    /// The `SFI0` feature bits of an emitted container.
+    fn features(dxil: &[u8]) -> u64 {
+        let c = Container::parse(dxil).unwrap();
+        let part = c.part(FourCC::SFI0).unwrap();
+        u64::from_le_bytes(part.data[..8].try_into().unwrap())
+    }
+
+    /// 64-bit image atomics (dmask 0x3, cmpswap 0xF: two dwords per value)
+    /// translate to DXIL's i64 atomics, and the shader requires 64-bit
+    /// atomics on typed and on heap resources (the bits DXC sets for
+    /// `InterlockedMax` on a `RWTexture2D<uint64_t>` from
+    /// `ResourceDescriptorHeap`).
+    #[test]
+    fn a_64_bit_image_atomic_requires_64_bit_typed_atomics() {
+        const INT64: u64 = 0x8000;
+        const TYPED: u64 = 0x40_0000;
+        const HEAP: u64 = 0x1000_0000;
+        let narrow = image_atomic(
+            // image_atomic_umax v2, v[0:1], s[4:11] dmask:0x1 dim:2D unorm glc
+            [0xF05C_3108, 0x0001_0200],
+            &[0x7E04_0300], // v_mov_b32 v2, v0
+        )
+        .unwrap();
+        assert_eq!(features(&narrow.dxil) & (TYPED | HEAP), 0);
+        let umax = image_atomic(
+            // image_atomic_umax v[2:3], v[0:1], s[4:11] dmask:0x3 dim:2D unorm glc
+            [0xF05C_3308, 0x0001_0200],
+            &[
+                0x7E04_0300, // v_mov_b32 v2, v0
+                0x7E06_0280, // v_mov_b32 v3, 0
+            ],
+        )
+        .unwrap();
+        let cmpswap = image_atomic(
+            // image_atomic_cmpswap v[2:5], v[0:1], s[4:11] dmask:0xf dim:2D unorm glc
+            [0xF040_3F08, 0x0001_0200],
+            &[
+                0x7E04_0300, // v_mov_b32 v2, v0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7E08_0301, // v_mov_b32 v4, v1
+                0x7E0A_02C1, // v_mov_b32 v5, -1
+            ],
+        )
+        .unwrap();
+        for wide in [umax, cmpswap] {
+            assert_eq!(
+                features(&wide.dxil) & (INT64 | TYPED | HEAP),
+                INT64 | TYPED | HEAP
+            );
+        }
+    }
+
+    /// An image atomic on some channels of a pair has no DXIL form.
+    #[test]
+    fn an_image_atomic_on_part_of_a_pair_is_refused() {
+        let err = image_atomic(
+            // image_atomic_umax v[2:3], v[0:1], s[4:11] dmask:0x5 dim:2D unorm glc
+            [0xF05C_3508, 0x0001_0200],
+            &[0x7E04_0300, 0x7E06_0280],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("an image atomic of some channels"),
+            "{err}"
+        );
     }
 }
