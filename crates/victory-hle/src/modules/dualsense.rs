@@ -137,7 +137,7 @@ fn read_reports(pad: &Pad) {
         if last == Some(reading) {
             continue;
         }
-        if log {
+        if log && last.is_none_or(|before| before.buttons != reading.buttons) {
             tracing::info!(
                 buttons = format_args!("{:#x}", reading.buttons),
                 left = format_args!(
