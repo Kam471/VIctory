@@ -1000,6 +1000,9 @@ impl<'a> Lower<'a> {
                 || reads_mask_as_data(x.st, i)
         };
         let reads_whole = insts().any(whole);
+        // `v_readfirstlane` on its own still needs the console wave: its
+        // first lane is not in the upper half of a split program.
+        let has_firstlane = insts().any(|i| i.name() == "v_readfirstlane_b32");
         let masks_held = {
             // Masks held as numbers or constant lane sets: the lane
             // tests its own bit by its console lane.
@@ -1115,7 +1118,7 @@ impl<'a> Lower<'a> {
             let pr_split = paired_host
                 && console_lanes
                 && !reads_whole
-                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
+                && !has_firstlane
                 && !masks_held
                 && s.lds_dwords == 0
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
@@ -1123,7 +1126,7 @@ impl<'a> Lower<'a> {
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
             let pr_console = paired_host
-                && console_lanes
+                && (console_lanes || has_firstlane)
                 && !pr_split
                 && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64

@@ -352,6 +352,48 @@ fn wave32_mode_uses_the_console_flow_for_paired_hosts() {
     }
 }
 
+/// The runtime's `Wave32` mode sends a program whose only lane operation is
+/// `v_readfirstlane` through the console flow too: the split form would
+/// read the upper half's own first lane.
+#[test]
+fn wave32_mode_uses_the_console_flow_for_readfirstlane_only() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0x7E12_0500, // v_readfirstlane_b32 s9, v0
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let target = host.target();
+        if target.runs(64) {
+            continue;
+        }
+        let p = program(&body, 64);
+        let options = super::TranslateOptions {
+            wave64: super::Wave64Mode::Wave32,
+            target,
+        };
+        let cs = emit_options(&p, options).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "{name}: the declared wave size");
+        let groups = 2;
+        let out = dispatch(&host, &p, &cs, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let expect: Vec<u32> = (0..groups)
+            .flat_map(|_| (0..64).map(|t| if t < 20 { 0 } else { 1 }))
+            .collect();
+        assert_eq!(out, expect, "{name}: Wave32 readfirstlane console flow");
+    }
+}
+
 /// Groups of several console waves need the halves to meet without a
 /// group barrier: not yet.
 #[test]
