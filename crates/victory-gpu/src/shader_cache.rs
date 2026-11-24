@@ -177,6 +177,7 @@ fn cached(
     (converter.translate)(container)
 }
 
+/// VSH2: root view registers are 16 bits (#614).
 const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -252,10 +253,14 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
-        word(&mut out, slots.len() as u32);
-        out.extend(slots);
+    for registers in [&s.root_cbvs, &s.root_srvs] {
+        word(&mut out, registers.len() as u32);
+        for r in registers {
+            out.extend(r.to_le_bytes());
+        }
     }
+    word(&mut out, s.root_uavs.len() as u32);
+    out.extend(&s.root_uavs);
     out
 }
 
@@ -273,6 +278,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         fn list(&mut self) -> Option<Vec<u8>> {
             let n = self.word()? as usize;
             Some(self.take(n)?.to_vec())
+        }
+        fn registers(&mut self) -> Option<Vec<u16>> {
+            let n = self.word()? as usize;
+            let bytes = self.take(n.checked_mul(2)?)?;
+            let pairs = bytes.as_chunks().0.iter();
+            Some(pairs.map(|&b| u16::from_le_bytes(b)).collect())
         }
     }
     let mut r = Reader(bytes);
@@ -310,8 +321,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             max_lod: f32::from_bits(r.word()?),
         });
     }
-    let root_cbvs = r.list()?;
-    let root_srvs = r.list()?;
+    let root_cbvs = r.registers()?;
+    let root_srvs = r.registers()?;
     let root_uavs = r.list()?;
     r.0.is_empty().then_some(HostShader {
         stage,
@@ -347,7 +358,8 @@ mod tests {
                 0,
             ])],
             root_cbvs: vec![2],
-            root_srvs: vec![0, 3],
+            // 0x305: an address in root constants 2 and 3 of parameter 5.
+            root_srvs: vec![0, 3, 0x305],
             root_uavs: vec![1],
         }
     }

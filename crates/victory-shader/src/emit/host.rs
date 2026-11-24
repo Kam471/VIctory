@@ -177,13 +177,13 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, u8)> = stages
+        let mut views: Vec<(u16, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
                 let cbvs = s.root_cbvs.iter().map(|&r| (r, 0u8));
                 let srvs = s.root_srvs.iter().map(|&r| (r, 1u8));
                 cbvs.chain(srvs)
-                    .chain(s.root_uavs.iter().map(|&r| (r, 2u8)))
+                    .chain(s.root_uavs.iter().map(|&r| (u16::from(r), 2u8)))
             })
             .collect();
         views.sort_unstable();
