@@ -337,16 +337,27 @@ impl Shadow {
         to - from
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
-        let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+    /// The runs of pages of `[from, to)` whose host copy is missing (`0`) or
+    /// older than the last write `written` reports for them, and the pages
+    /// wholly inside the range, which a copy makes current. `base` is the
+    /// page number of `bounds`'s start, the copy's title memory.
+    fn stale_runs(
+        copied: &[u64],
+        base: usize,
+        from: usize,
+        to: usize,
+        written: &[(usize, u64)],
+        bounds: (usize, usize),
+    ) -> (Vec<(usize, usize)>, Vec<usize>) {
+        let (start, end) = bounds;
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut runs, mut fresh) = (Vec::new(), Vec::new());
+        let mut run: Option<usize> = None;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
+            while matches!(writes.peek(), Some(&&(p, _)) if p < page) {
+                writes.next();
+            }
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
                     writes.next();
@@ -354,22 +365,38 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            if copied[page - base] == 0 || write > copied[page - base] {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    fresh.push(page);
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                runs.push((first, page));
             }
         }
-        // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            runs.push((first, last + 1));
+        }
+        (runs, fresh)
+    }
+
+    /// Copies the pages of `[from, to)` written after their last copy
+    /// (`written`: last writes by page, in page order; `now`: this
+    /// asking), whole pages within the buffer.
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        let base = self.start as usize / PAGE;
+        let bounds = (self.start as usize, (self.start + self.len) as usize);
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (runs, fresh) = Shadow::stale_runs(&copied, base, from, to, written, bounds);
+        for page in fresh {
+            copied[page - base] = now;
+        }
+        let mut bytes = 0;
+        for (first, last) in runs {
+            // Cut to the range: next to it shaders may be writing the copy.
+            bytes += self.copy((first * PAGE).max(from), (last * PAGE).min(to));
         }
         bytes
     }
@@ -531,4 +558,88 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A title write between two submissions: the second asking's journal
+    /// entry is newer than the copy's watermark, so only that page copies.
+    #[test]
+    fn a_write_between_two_submissions_copies_only_that_page() {
+        let base = 100;
+        let (start, end) = (base * PAGE, (base + 4) * PAGE);
+        let bounds = (start, end);
+        let mut copied = [0u64; 4];
+        let (runs, fresh) = Shadow::stale_runs(&copied, base, start, end, &[], bounds);
+        assert_eq!(runs, [(100, 104)]);
+        assert_eq!(fresh, [100, 101, 102, 103]);
+        for page in fresh {
+            copied[page - base] = 5; // copied at asking 5
+        }
+
+        // Nothing written: the next submission copies nothing.
+        let (runs, fresh) = Shadow::stale_runs(&copied, base, start, end, &[], bounds);
+        assert!(runs.is_empty() && fresh.is_empty());
+
+        // A title thread writes page 102 between submissions; the next
+        // asking reports it at 6, and only that page copies.
+        let (runs, fresh) = Shadow::stale_runs(&copied, base, start, end, &[(102, 6)], bounds);
+        assert_eq!(runs, [(102, 103)]);
+        assert_eq!(fresh, [102]);
+    }
+
+    /// Two host copies over the same title memory (overlapping shadow
+    /// buffers) keep separate watermarks. Both see the journal's write; one
+    /// that copied after the write skips it, one that copied the range
+    /// before the write copies just that page, and one that never copied
+    /// takes the whole range.
+    #[test]
+    fn overlapping_copies_see_the_same_journal_write() {
+        let base = 200;
+        let (start, end) = (base * PAGE, (base + 8) * PAGE);
+        let bounds = (start, end);
+        let mut early = [0u64; 8];
+        let mut before = [0u64; 8];
+        let never = [0u64; 8];
+        let write = [(204, 7)];
+        let (_, fresh) = Shadow::stale_runs(&early, base, start, end, &[], bounds);
+        for page in fresh {
+            early[page - base] = 7; // copied after the write's asking
+        }
+        let (_, fresh) = Shadow::stale_runs(&before, base, start, end, &[], bounds);
+        for page in fresh {
+            before[page - base] = 6; // copied before the write's asking
+        }
+
+        let range = (start + 2 * PAGE, start + 6 * PAGE);
+        let (runs, fresh) = Shadow::stale_runs(&early, base, range.0, range.1, &write, bounds);
+        assert!(runs.is_empty() && fresh.is_empty(), "already current");
+
+        let (runs, fresh) = Shadow::stale_runs(&before, base, range.0, range.1, &write, bounds);
+        assert_eq!(runs, [(204, 205)]);
+        assert_eq!(fresh, [204]);
+
+        let (runs, fresh) = Shadow::stale_runs(&never, base, range.0, range.1, &write, bounds);
+        assert_eq!(runs, [(202, 206)]);
+        assert_eq!(fresh, [202, 203, 204, 205]);
+    }
+
+    #[test]
+    fn a_partial_page_stays_stale_outside_the_range() {
+        let base = 300;
+        let (start, end) = (base * PAGE, (base + 2) * PAGE);
+        let bounds = (start, end);
+        let copied = [0u64; 2];
+        // One byte into page 300 through one byte of page 301: both pages
+        // are copied in part, so neither is marked current.
+        let (runs, fresh) =
+            Shadow::stale_runs(&copied, base, start + 1, start + PAGE + 1, &[], bounds);
+        assert_eq!(runs, [(300, 302)]);
+        assert!(fresh.is_empty());
+        // A whole page is marked current after its copy.
+        let (_, fresh) = Shadow::stale_runs(&copied, base, start, start + PAGE, &[], bounds);
+        assert_eq!(fresh, [300]);
+    }
 }

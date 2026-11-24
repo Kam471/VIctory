@@ -378,6 +378,77 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    #[test]
+    fn a_write_between_two_askings_is_reported_by_the_second() {
+        forget();
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        // First submission: nothing written, its bits are cleared.
+        let (first, before) = writes(start, end, false).expect("watched");
+        assert!(before.is_empty());
+        // A title thread writes between the submissions.
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write(1) };
+        let (second, after) = writes(start, end, false).expect("watched");
+        assert!(second > first);
+        assert_eq!(after, [(p / PAGE + 2, second)]);
+        // An overlapping host copy that last copied before the write sees
+        // it from the journal, without the kernel reporting it again.
+        let (later, again) = writes(p + 2 * PAGE, p + 3 * PAGE, false).expect("watched");
+        assert!(later > second);
+        assert_eq!(again, [(p / PAGE + 2, second)]);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// What a watch costs: the kernel scans every page of the range it is
+    /// given, plus a fixed cost per call. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture watch_scan_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn watch_scan_cost() {
+        forget();
+        const SIZE: usize = 64 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let _ = writes(p, p + SIZE, false); // warm up
+        // Each row asks about the same 512 MiB in all, in ranges of `span`.
+        for span in [64 << 10, 1 << 20, 4 << 20, 16 << 20] {
+            let calls = (16 * SIZE) / span;
+            let started = std::time::Instant::now();
+            for _ in 0..calls {
+                assert!(writes(p, p + span, false).is_some());
+            }
+            let took = started.elapsed();
+            println!(
+                "{:>6} KiB x {calls:>5}: {:>9.2?} ({:>7.0} ns/call, {:>5.1} GB/s)",
+                span >> 10,
+                took,
+                took.as_nanos() as f64 / calls as f64,
+                (span as f64 * calls as f64) / took.as_secs_f64() / 1e9,
+            );
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]

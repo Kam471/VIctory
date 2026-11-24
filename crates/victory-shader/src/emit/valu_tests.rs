@@ -3,7 +3,8 @@
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and denormal
+//! operands of `v_mul_legacy_f32`.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -100,6 +101,11 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    try_build_valu_cs(body).expect("lower")
+}
+
+/// [`build_valu_cs`], with the lowering's refusal as an error.
+fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -169,7 +175,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         mesh_stride: 0,
         options: Default::default(),
     })
-    .expect("lower");
+    .map_err(|e| format!("{e:?}"))?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -190,7 +196,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
@@ -352,6 +358,58 @@ fn v_med3_f16_matches_rdna2_with_nan() {
             ),
         }
     });
+}
+
+/// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
+/// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
+#[test]
+fn v_cmp_lg_is_false_for_nan() {
+    // v_cmp_lg_{f32,f16}_e64 s20, v1, v2 (VOPC 0x005 / 0x0cd in VOP3);
+    // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)
+    let nan = f32::NAN.to_bits();
+    let (inf, ninf) = (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
+    let f = f32::to_bits;
+    let f32_cases: &[([u32; 4], u32)] = &[
+        ([f(1.0), f(2.0), 0, 0], 1),
+        ([f(2.0), f(1.0), 0, 0], 1),
+        ([f(1.0), f(1.0), 0, 0], 0),
+        ([f(0.0), f(-0.0), 0, 0], 0),
+        ([inf, ninf, 0, 0], 1),
+        ([inf, inf, 0, 0], 0),
+        ([nan, f(1.0), 0, 0], 0),
+        ([f(1.0), nan, 0, 0], 0),
+        ([nan, nan, 0, 0], 0),
+        ([0x7F80_0001, f(0.0), 0, 0], 0), // a signalling NaN
+    ];
+    let f16_cases: &[([u32; 4], u32)] = &[
+        ([0x3C00, 0x4000, 0, 0], 1),
+        ([0x4000, 0x3C00, 0, 0], 1),
+        ([0x3C00, 0x3C00, 0, 0], 0),
+        ([0x0000, 0x8000, 0, 0], 0),
+        ([0x7C00, 0xFC00, 0, 0], 1),
+        ([0x7E00, 0x3C00, 0, 0], 0),
+        ([0x3C00, 0x7E00, 0, 0], 0),
+        ([0x7E00, 0x7E00, 0, 0], 0),
+        ([0x7C01, 0x0000, 0, 0], 0),           // a signalling NaN
+        ([0xABCD_3C00, 0x1234_7E00, 0, 0], 0), // only the low halves are read
+    ];
+    for (op, what, cases) in [
+        (0x005u16, "v_cmp_lg_f32", f32_cases),
+        (0x0cd, "v_cmp_lg_f16", f16_cases),
+    ] {
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
 }
 
 #[test]
@@ -1539,4 +1597,300 @@ fn lane_mask_phi_joins_execute_correctly() {
                 .collect(),
         )],
     );
+}
+
+#[test]
+fn v_mul_legacy_f32_treats_denormals_as_zero() {
+    // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
+    let shader = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), vgpr(0)));
+    let f = f32::to_bits;
+    let (denorm, neg_denorm, min_normal) = (0x0000_0001u32, 0x8040_0000u32, 0x0080_0000u32);
+
+    let cases: &[(u32, u32, u32)] = &[
+        // Zero or denormal times anything, non-finite included, is +0.
+        (f(0.0), f(f32::INFINITY), f(0.0)),
+        (f(-0.0), f(f32::NAN), f(0.0)),
+        (f(f32::NAN), f(0.0), f(0.0)),
+        (denorm, f(f32::INFINITY), f(0.0)),
+        (f(f32::NAN), neg_denorm, f(0.0)),
+        (denorm, f(2.0f32.powi(100)), f(0.0)),
+        // The smallest normal is not zero.
+        (min_normal, f(2.0), f(f32::MIN_POSITIVE * 2.0)),
+        // Ordinary products.
+        (f(1.5), f(-4.0), f(-6.0)),
+        (f(3.0), f(0.5), f(1.5)),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+/// MTBUF `op vdata, v5, s[8:11], 0 format:fmt offset:16` (no offen/idxen;
+/// `op` 4..7 stores x..xyzw, 12..15 their d16 forms).
+const fn mtbuf_store(op: u8, fmt: u8, vdata: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (fmt as u32) << 19 | (op as u32 & 7) << 16 | 16,
+        0x80 << 24 | (op as u32 >> 3 & 1) << 21 | (8 >> 2) << 16 | (vdata as u32) << 8 | 5,
+    ]
+}
+
+/// Runs `shader` once with root constants `inputs` on every available
+/// SM 6.6 host and returns the first `dwords` of its raw UAV, per device.
+fn run_dwords(shader: &HostShader, inputs: [u32; 4], dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let r = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(dwords)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push((label, r[0].clone()));
+    }
+    assert!(
+        !out.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    out
+}
+
+#[test]
+fn tbuffer_store_format_writes_the_formats_layout() {
+    let f = |x: f32| x.to_bits();
+    // (what, op, format, data in v1..v4, dwords 4..8 afterwards)
+    type Case = (&'static str, u8, u8, [u32; 4], [u32; 4]);
+    let cases: &[Case] = &[
+        (
+            "32_32_32_32 float xyzw",
+            7,
+            77,
+            [f(1.5), f(-0.0), 0x7FC0_1234, 0x0000_0001],
+            [f(1.5), f(-0.0), 0x7FC0_1234, 0x0000_0001],
+        ),
+        (
+            "32_32_32_32 sint xyzw",
+            7,
+            76,
+            [u32::MAX, 0x8000_0000, 7, 0x1234_5678],
+            [u32::MAX, 0x8000_0000, 7, 0x1234_5678],
+        ),
+        (
+            "32_32_32 float xyz",
+            6,
+            74,
+            [f(2.0), f(3.0), f(4.0), 0xDEAD_BEEF],
+            [f(2.0), f(3.0), f(4.0), 0],
+        ),
+        (
+            "32_32 uint xy",
+            5,
+            63,
+            [0xAABB_CCDD, 9, 0xDEAD_BEEF, 0xDEAD_BEEF],
+            [0xAABB_CCDD, 9, 0, 0],
+        ),
+        (
+            "32 float x",
+            4,
+            22,
+            [f(-7.25), 1, 2, 3],
+            [f(-7.25), 0, 0, 0],
+        ),
+        (
+            // d16: the halves are stored as they are.
+            "16_16 float d16_xy",
+            13,
+            29,
+            [0xBC00_3555, 0xDEAD_BEEF, 0, 0],
+            [0xBC00_3555, 0, 0, 0],
+        ),
+        (
+            "16_16_16_16 float d16_xyzw",
+            15,
+            71,
+            [0x1234_5678, 0x7C00_FC00, 0, 0],
+            [0x1234_5678, 0x7C00_FC00, 0, 0],
+        ),
+    ];
+    for &(what, op, fmt, inputs, want) in cases {
+        let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0
+        body.extend(mtbuf_store(op, fmt, 1));
+        let shader = build_valu_cs(&body);
+        for (backend, out) in run_dwords(&shader, inputs, 8) {
+            assert_eq!(
+                out[4..8],
+                want,
+                "{backend}: tbuffer_store {what}: wrote {:#010x?}, want {want:#010x?}",
+                &out[4..8],
+            );
+        }
+    }
+}
+
+#[test]
+fn tbuffer_store_format_refuses_what_it_does_not_convert() {
+    for (what, op, fmt, reason) in [
+        ("8_8_8_8 unorm", 7, 56, "a converted or narrow format"),
+        ("16_16 uint", 5, 27, "a converted or narrow format"),
+        ("16 float", 4, 13, "an element under a dword"),
+        (
+            "32_32_32_32 float, xy only",
+            5,
+            77,
+            "some of its format's channels",
+        ),
+        ("32 float d16_x", 12, 22, "a converted or narrow format"),
+        // f32 to f16 waits for nearest-even narrowing (#422).
+        ("16_16 float xy", 5, 29, "a converted or narrow format"),
+        (
+            "16_16_16_16 float xyzw",
+            7,
+            71,
+            "a converted or narrow format",
+        ),
+    ] {
+        let mut body = vec![vop1(0x001, 5, 0x80)];
+        body.extend(mtbuf_store(op, fmt, 1));
+        match try_build_valu_cs(&body) {
+            Ok(_) => panic!("tbuffer_store {what} lowered; it should be refused"),
+            Err(e) => assert!(e.contains(reason), "tbuffer_store {what}: refused with {e}"),
+        }
+    }
+}
+
+/// Indexed (structured) loads, stores and atomics through a root UAV whose
+/// title declares a stride reach byte `index * stride + offset` of the
+/// buffer the root UAV binds: the host view is raw, with no stride of its own.
+#[test]
+fn structured_access_through_a_root_uav_reaches_index_times_stride() {
+    const STRIDE: u32 = 8;
+    // MUBUF `op vdata, vaddr(index), s[srsrc:srsrc+3], 0 idxen offset:off`.
+    let mubuf_idxen = |op: u32, vdata: u8, vaddr: u8, srsrc: u8, off: u16| -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13 | (off as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    };
+    const STORE: u32 = 0x1C; // buffer_store_dword
+    const LOAD: u32 = 0x0C; // buffer_load_dword
+    const ATOMIC_ADD: u32 = 0x32; // buffer_atomic_add (no return)
+
+    let mut words = vec![
+        // A buffer descriptor around the root UAV s[0:1] in s[8:11].
+        s_mov_b32(8, 0),
+        s_mov_b32(9, 1),
+        s_mov_b32(10, 0xC1), // -1 records
+        s_mov_b32(11, 0xFF),
+        0x3101_4FAC,
+        vop1(0x001, 1, 128 + 2), // v1 = 2 (index)
+        vop1(0x001, 2, 0xFF),    // v2 = 0xABCD
+        0x0000_ABCD,
+        vop1(0x001, 3, 128 + 5), // v3 = 5
+        vop1(0x001, 5, 128),     // v5 = 0 (index)
+    ];
+    // Element 2: dword 5 = 0xABCD, dword 4 += 5; then element 0, dword 0 =
+    // what element 2 byte 4 holds.
+    words.extend(mubuf_idxen(STORE, 2, 1, 8, 4));
+    words.extend(mubuf_idxen(ATOMIC_ADD, 3, 1, 8, 0));
+    words.extend(mubuf_idxen(LOAD, 4, 1, 8, 4));
+    words.extend(mubuf_idxen(STORE, 4, 5, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: STRIDE,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).expect("container");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+    assert_eq!(shader.root_uavs, vec![0]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 4])), (1, Root::Uav(8))],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            &out[0][..8],
+            &[0xABCD, 0, 0, 0, 5, 0xABCD, 0, 0],
+            "{label}: element 2 is bytes 16..24 of the buffer"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
