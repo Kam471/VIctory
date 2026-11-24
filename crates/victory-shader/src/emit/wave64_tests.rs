@@ -220,7 +220,10 @@ fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, Shade
         &st,
         &io_res,
         &res,
-        TranslateOptions { wave64: mode, ..Default::default() },
+        TranslateOptions {
+            wave64: mode,
+            ..Default::default()
+        },
     )
 }
 
@@ -640,7 +643,10 @@ mod gpu {
             &st,
             &io,
             &res,
-            TranslateOptions { wave64: mode, ..Default::default() },
+            TranslateOptions {
+                wave64: mode,
+                ..Default::default()
+            },
         )
     }
 

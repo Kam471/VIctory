@@ -98,7 +98,7 @@ impl Host {
         }
     }
 
-   /// Wave-operation support and `(min, max)` hardware lane counts.
+    /// Wave-operation support and `(min, max)` hardware lane counts.
     pub fn wave_lanes(&self) -> (bool, u32, u32) {
         let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         // SAFETY: plain D3D12 feature query with valid struct size.

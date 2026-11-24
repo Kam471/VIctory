@@ -858,7 +858,7 @@ fn compute_uniformity(
                 }
             }
         }
-       if next_blocks != blocks {
+        if next_blocks != blocks {
             blocks = next_blocks;
             changed = true;
         }

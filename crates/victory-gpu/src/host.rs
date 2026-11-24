@@ -286,7 +286,8 @@ fn wave_range(device: &ID3D12Device) -> Option<victory_shader::emit::WaveRange> 
             )
             .is_ok()
     };
-    (ok && opts.WaveOps.as_bool() && opts.WaveLaneCountMin > 0
+    (ok && opts.WaveOps.as_bool()
+        && opts.WaveLaneCountMin > 0
         && opts.WaveLaneCountMin <= opts.WaveLaneCountMax)
         .then_some(victory_shader::emit::WaveRange {
             min: opts.WaveLaneCountMin,

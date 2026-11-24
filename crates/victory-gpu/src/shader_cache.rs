@@ -373,7 +373,6 @@ mod tests {
         }
     }
 
-
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -410,25 +409,49 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
+            cached(
+                &cache,
+                &build,
+                opts(Wave64Mode::Native),
+                container,
+                translate
+            ),
             Ok(shader())
         );
         assert_eq!(
-            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
+            cached(
+                &cache,
+                &build,
+                opts(Wave64Mode::Native),
+                container,
+                translate
+            ),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another Wave64 mode translates separately.
         assert_eq!(
-            cached(&cache, &build, opts(Wave64Mode::Wave32), container, translate),
+            cached(
+                &cache,
+                &build,
+                opts(Wave64Mode::Wave32),
+                container,
+                translate
+            ),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // Another build translates again.
         assert_eq!(
-            cached(&cache, &[8; 32], opts(Wave64Mode::Native), container, translate),
+            cached(
+                &cache,
+                &[8; 32],
+                opts(Wave64Mode::Native),
+                container,
+                translate
+            ),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -438,12 +461,24 @@ mod tests {
             std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(
-            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
+            cached(
+                &cache,
+                &build,
+                opts(Wave64Mode::Native),
+                container,
+                translate
+            ),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 4);
         assert_eq!(
-            cached(&cache, &build, opts(Wave64Mode::Native), container, translate),
+            cached(
+                &cache,
+                &build,
+                opts(Wave64Mode::Native),
+                container,
+                translate
+            ),
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 4);
