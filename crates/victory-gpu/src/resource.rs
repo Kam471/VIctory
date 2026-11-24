@@ -2328,11 +2328,19 @@ mod tests {
             for y in 0..16 {
                 let row = &data[y * 256..y * 256 + 16 * 4];
                 for x in 0..16 {
-                    assert_eq!(
-                        &row[x * 4..x * 4 + 4],
-                        &[64, 128, 191, 255],
-                        "pixel ({x}, {y})"
-                    );
+                    // One UNORM unit of slack: the target conversion rounds
+                    // 128/255 to 127 on some host GPUs.
+                    let got = &row[x * 4..x * 4 + 4];
+                    for (channel, (&a, &b)) in got
+                        .iter()
+                        .zip(&[64u8, 128, 191, 255])
+                        .enumerate()
+                    {
+                        assert!(
+                            a.abs_diff(b) <= 1,
+                            "pixel ({x}, {y}) channel {channel}: {got:?}"
+                        );
+                    }
                 }
             }
             readback.Unmap(0, None);
