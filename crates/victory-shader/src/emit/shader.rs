@@ -90,6 +90,7 @@ impl RawWindow {
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const UAVS_64: u64 = 1 << 15;
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
@@ -665,6 +666,10 @@ impl Shader {
         } else {
             None
         };
+        // A pixel shader with an SV_StencilRef output (as DXC collects it).
+        if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
+            self.flags |= flags::STENCIL_REF;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -748,6 +753,9 @@ impl Shader {
         }
         if self.flags & flags::UAVS_64 != 0 {
             features |= 0x8;
+        }
+        if self.flags & flags::STENCIL_REF != 0 {
+            features |= 0x200;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
