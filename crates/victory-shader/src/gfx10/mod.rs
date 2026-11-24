@@ -318,7 +318,7 @@ impl Encoding {
     }
 }
 
-fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
+pub(crate) fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
     // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
     let (encoding, op) = match (encoding, opcode) {
         (Encoding::Vop3, 0x000..0x100) => (Encoding::Vopc, opcode),
