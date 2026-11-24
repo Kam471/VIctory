@@ -2124,3 +2124,47 @@ fn lds_narrow_opcodes_all_translate() {
     }
     lower_lds(&body);
 }
+
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], offset:byte`.
+const fn buffer_store_at(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// MUBUF narrow load `op vdst, vaddr, s[8:11], offset:byte` (no index).
+const fn buffer_load_narrow(op: u32, byte_off: u16, vaddr: u8, vdst: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | op << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | 2 << 16 | (vdst as u32) << 8 | vaddr as u32,
+    ]
+}
+
+#[test]
+fn narrow_buffer_loads_read_the_containing_dword() {
+    // v1 = s0 (the stored dword), v5 = 0 (the byte address). Each program
+    // stores v1 at dword 0 and loads a byte or half of it.
+    let store = buffer_store_at(1, 5, 8, 0);
+    let cases = [[0x1234_5678, 0, 0, 0], [0x89ab_cdef, 0, 0, 0]];
+    let load = |op, byte_off, v0: &[u32]| {
+        let mut body = vec![vop1(0x001, 5, 0x80)];
+        body.extend_from_slice(v0);
+        body.extend_from_slice(&store);
+        body.extend_from_slice(&buffer_load_narrow(op, byte_off, 5, 0));
+        body
+    };
+    let ones = [vop1(0x001, 0, 0x80), vop1(0x037, 0, vgpr(0))];
+    for (body, expect) in [
+        (load(0x00a, 2, &[]), [0x0000_1234_u32, 0x0000_89ab]),
+        (load(0x00b, 2, &[]), [0x0000_1234, 0xffff_89ab]),
+        (load(0x009, 1, &[]), [0x0000_0056, 0xffff_ffcd]),
+        (load(0x008, 0, &[]), [0x0000_0078, 0x0000_00ef]),
+        (load(0x025, 2, &ones), [0x1234_ffff, 0x89ab_ffff]),
+    ] {
+        let shader = lower_lds(&body);
+        run_cases(&shader, &cases, |device, i, _, out| {
+            assert_eq!(out, expect[i], "{device}: case {i}");
+        });
+    }
+}

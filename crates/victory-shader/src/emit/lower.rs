@@ -9225,6 +9225,21 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        // Byte and half loads: (bits, signed, d16 placement), placement 1 for
+        // the low half and 2 for the high one.
+        let narrow = match plain.strip_prefix("buffer_load_") {
+            Some("ubyte") => Some((8u32, false, 0u8)),
+            Some("sbyte") => Some((8u32, true, 0)),
+            Some("ushort") => Some((16u32, false, 0)),
+            Some("sshort") => Some((16u32, true, 0)),
+            Some("ubyte_d16") => Some((8u32, false, 1)),
+            Some("ubyte_d16_hi") => Some((8u32, false, 2)),
+            Some("sbyte_d16") => Some((8u32, true, 1)),
+            Some("sbyte_d16_hi") => Some((8u32, true, 2)),
+            Some("short_d16") => Some((16u32, false, 1)),
+            Some("short_d16_hi") => Some((16u32, false, 2)),
+            _ => None,
+        };
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
@@ -9232,6 +9247,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_store_"))
         {
             _ if atomic.is_some() => (false, 1),
+            _ if narrow.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -9348,6 +9364,59 @@ impl<'a> Lower<'a> {
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
+            return Ok(());
+        }
+        if let Some((bits, signed, place)) = narrow {
+            // shortcut: the containing dword is read from its aligned start,
+            // so a narrow read in the last three bytes of a buffer may read 0
+            // rather than its in-bounds bytes.
+            if index.is_some() {
+                return Err("a narrow buffer load by index");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let (three, not3) = (self.s.m.i32(3), self.s.m.i32(!3));
+            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, iu, mask, align],
+            );
+            let word = self.s.m.extract(c, r, 0);
+            let word = self.as_int(word);
+            let x = self.s.m.bin(c, Bin::LShr, word, shift);
+            let x = if signed {
+                // Up to the top, then arithmetically back down.
+                let up = self.s.m.i32(32 - bits);
+                let t = self.s.m.bin(c, Bin::Shl, x, up);
+                self.s.m.bin(c, Bin::AShr, t, up)
+            } else {
+                let keep = self.s.m.i32((1u32 << bits) - 1);
+                self.s.m.bin(c, Bin::And, x, keep)
+            };
+            let x = match place {
+                1 => self.low_half(inst, reg, x),
+                2 => {
+                    let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => self.s.m.i32(0),
+                    };
+                    let (low, sixteen) = (self.s.m.i32(0xFFFF), self.s.m.i32(16));
+                    let old = self.s.m.bin(c, Bin::And, old, low);
+                    let x = self.s.m.bin(c, Bin::Shl, x, sixteen);
+                    self.s.m.bin(c, Bin::Or, old, x)
+                }
+                _ => x,
+            };
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         if let (true, Some(f)) = (store, *format) {
