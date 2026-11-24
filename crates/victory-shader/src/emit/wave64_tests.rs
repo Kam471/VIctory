@@ -1,7 +1,7 @@
 //! Tests for Wave64-on-Wave32 and portable LDS Wave64 compute lowering,
 //! using synthetic GFX10 machine code on hardware GPU and WARP.
 
-use super::{HostShader, TranslateOptions, Wave64Mode, emit_with, translate_with};
+use super::{HostShader, Target, TranslateOptions, Wave64Mode, emit_with, translate_with};
 use crate::dxbc::{Container, FourCC};
 use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
 use crate::{ShaderError, io, ir, resource, structure};
@@ -220,7 +220,10 @@ fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, Shade
         &st,
         &io_res,
         &res,
-        TranslateOptions { wave64: mode },
+        TranslateOptions {
+            wave64: mode,
+            target: Target::ANY,
+        },
     )
 }
 
@@ -431,6 +434,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Native,
+            target: Target::ANY,
         },
     )
     .unwrap();
@@ -439,6 +443,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Wave32,
+            target: Target::ANY,
         },
     )
     .unwrap();
@@ -447,6 +452,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Emulate,
+            target: Target::ANY,
         },
     )
     .unwrap();
@@ -637,7 +643,10 @@ mod gpu {
             &st,
             &io,
             &res,
-            TranslateOptions { wave64: mode },
+            TranslateOptions {
+            wave64: mode,
+            target: Target::ANY,
+        },
         )
     }
 
