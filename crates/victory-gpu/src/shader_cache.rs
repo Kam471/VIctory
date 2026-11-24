@@ -172,10 +172,11 @@ fn cached(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
     let mode = [mode_byte(options.wave64)];
-    let waves = match options.host_waves {
-        Some(r) => [1, 0, 0, 0, r.min.to_le_bytes(), r.max.to_le_bytes()].concat(),
-        None => vec![0],
-    };
+    let mut waves = Vec::new();
+    if let Some(r) = options.host_waves {
+        waves.extend_from_slice(&r.min.to_le_bytes());
+        waves.extend_from_slice(&r.max.to_le_bytes());
+    }
     let input = [&build[..], &mode[..], &waves[..], container].concat();
     let converter = Translate {
         translate,

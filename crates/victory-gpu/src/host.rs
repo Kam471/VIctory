@@ -46,8 +46,6 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    /// Wave sizes reported by `D3D12_FEATURE_D3D12_OPTIONS1` (`None` if unavailable).
-    pub(crate) wave_range: Option<victory_shader::emit::WaveRange>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -233,7 +231,6 @@ fn create() -> windows::core::Result<Host> {
         );
         Ok(Host {
             device,
-            wave_range,
             queue,
             fence,
             submitted: Mutex::new(0),
