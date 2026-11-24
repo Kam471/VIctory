@@ -649,7 +649,13 @@ impl<'a> Lower<'a> {
                 // A group of at most 32 lanes leaves lanes 32..63 inactive on
                 // a Wave64 console, so a 32-lane host wave matches bit for bit
                 // and lets Wave32-only GPUs (e.g. NVIDIA) accept the pipeline.
-                s.wave_size = Some(if threads <= 32 { 32 } else { wave });
+                // `VICTORY_WAVE32_FORCE` (diagnostics) also forces the larger
+                // groups, to measure what their refusal costs.
+                s.wave_size = Some(if threads <= 32 || super::wave32_force() {
+                    32
+                } else {
+                    wave
+                });
             }
         }
         let mut no_barrier = HashSet::new();

@@ -122,6 +122,21 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// With the `diagnostics` feature, `VICTORY_WAVE32_FORCE=1` makes every
+/// compute program that would ask for a 64-lane wave ask for 32 instead.
+///
+/// This is the experiment from issue #71: a Wave32-only GPU (NVIDIA) then
+/// creates pipelines that were refused, but a program that really uses
+/// 64-lane ballots or lane numbers computes with 32-lane semantics. Part of
+/// the translation, so the shader cache keys on it.
+pub fn wave32_force() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_WAVE32_FORCE").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
