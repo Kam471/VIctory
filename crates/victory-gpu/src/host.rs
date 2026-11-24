@@ -290,6 +290,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_title_copy_forgets_only_the_host_copies_over_it() {
+        let refreshed = |start: usize, end: usize| Refreshed {
+            start,
+            end,
+            ranges: [(start, end - start)].into(),
+        };
+        let mut holds = Holds::default();
+        holds.refreshed.insert(1, refreshed(0x1000, 0x2000));
+        holds.refreshed.insert(2, refreshed(0x8000, 0x9000));
+
+        // A copy inside the first host copy's memory forgets only that one.
+        holds.copied(0x1800, 0x100);
+        assert!(!holds.refreshed.contains_key(&1));
+        assert!(holds.refreshed.contains_key(&2));
+
+        // A copy that ends where it starts does not touch it.
+        holds.refreshed.insert(1, refreshed(0x1000, 0x2000));
+        holds.copied(0x2000, 0x100);
+        assert!(holds.refreshed.contains_key(&1));
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -460,11 +482,56 @@ struct Deferred {
 /// submission (a world frame splits into hundreds of lists).
 #[derive(Default)]
 struct Holds {
-    /// Buffer ranges refreshed since the last title copy (host copy,
-    /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Per host copy (by address of its `Arc`): the title memory it covers
+    /// and the ranges refreshed since the last title copy into that memory.
+    refreshed: std::collections::HashMap<usize, Refreshed>,
     /// Textures whose contents the title list brings up to date.
     textures: std::collections::HashSet<usize>,
+}
+
+#[derive(Default)]
+struct Refreshed {
+    /// Title memory the host copy covers.
+    start: usize,
+    end: usize,
+    /// Refreshed ranges (address, bytes).
+    ranges: std::collections::HashSet<(usize, usize)>,
+}
+
+impl Holds {
+    /// Notes that `[address, address + len)` of `shadow` is refreshed;
+    /// false if it already was.
+    fn note(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) -> bool {
+        let (start, length) = shadow.bounds();
+        self.refreshed
+            .entry(std::sync::Arc::as_ptr(shadow) as usize)
+            .or_insert_with(|| Refreshed {
+                start,
+                end: start.saturating_add(length),
+                ranges: Default::default(),
+            })
+            .ranges
+            .insert((address, len))
+    }
+
+    /// A title copy into `[at, at + len)` changes what a refresh would find
+    /// only for the host copies over that memory: forget those, keep the
+    /// others (the world copies into small upload rings every frame, which
+    /// used to throw away every refresh in the title list).
+    fn copied(&mut self, at: usize, len: usize) {
+        let end = at.saturating_add(len);
+        self.refreshed.retain(|_, r| r.end <= at || r.start >= end);
+    }
+
+    fn clear(&mut self) {
+        self.refreshed.clear();
+        self.textures.clear();
+    }
 }
 
 /// Whether a split list keeps the refreshes of the list it continues
@@ -1052,11 +1119,10 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         // A title list reset starts the refreshes over too.
-        {
-            let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
-            holds.refreshed.clear();
-            holds.textures.clear();
-        }
+        self.holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // A title list reset starts a fresh list for the split budget too.
@@ -1202,8 +1268,7 @@ impl HostList {
         self.holds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .refreshed
-            .clear();
+            .copied(dst as usize, len);
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1224,14 +1289,12 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         // Lock order: deferred, then holds (see `defer_copy`).
         let first = self
             .holds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .refreshed
-            .insert(key);
+            .note(shadow, address, len);
         if first {
             deferred
                 .copies
@@ -1347,7 +1410,6 @@ impl HostList {
         self.holds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .refreshed
             .clear();
     }
 

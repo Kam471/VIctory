@@ -142,6 +142,11 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
+    /// The title memory this host copy stands for: start address, bytes.
+    pub(crate) fn bounds(&self) -> (usize, usize) {
+        (self.start as usize, self.len as usize)
+    }
+
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
     /// one snapshot per copy and submission, grown to cover every range the
