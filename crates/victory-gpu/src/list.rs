@@ -483,8 +483,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            ensure_state(&list, dst, COPY_DEST);
-            ensure_state(&list, src, COPY_SOURCE);
+            if crate::texture::title_written(from) {
+                crate::texture::upload(list, src, from);
+            }
+            ensure_state(list, dst, COPY_DEST);
+            ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
