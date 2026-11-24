@@ -146,6 +146,9 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// container in, the encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
+    /// Bytes before the container in the cache input: the build, the mode
+    /// and, when the host reports one, the wave range.
+    prefix: usize,
     ran: AtomicBool,
 }
 
@@ -159,7 +162,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[33..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[self.prefix..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
@@ -180,6 +183,7 @@ fn cached(
     let input = [&build[..], &mode[..], &waves[..], container].concat();
     let converter = Translate {
         translate,
+        prefix: 32 + 1 + waves.len(),
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
@@ -504,6 +508,28 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn a_wave_range_is_not_part_of_the_shader_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [4u8; 32];
+        let container = b"DXBC a console container".as_slice();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let translate = |c: &[u8]| {
+            seen.lock().unwrap().extend_from_slice(c);
+            Ok(shader())
+        };
+        let options = TranslateOptions {
+            wave64: Wave64Mode::Wave32,
+            host_waves: Some(WaveRange { min: 32, max: 32 }),
+        };
+        assert_eq!(
+            cached(&cache, &build, options, container, translate),
+            Ok(shader())
+        );
+        assert_eq!(&*seen.lock().unwrap(), container);
     }
 
     #[test]
